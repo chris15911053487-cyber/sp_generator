@@ -6,6 +6,9 @@ from app.agent.nodes import (
     verify_node, deploy_check_node, deploy_node,
 )
 
+# 模块级单例 MemorySaver — 确保状态在跨请求间持久
+_memory = MemorySaver()
+
 
 def _after_clarify(state: AgentState) -> str:
     if state.get("mode") == "design":
@@ -35,5 +38,4 @@ def create_graph() -> StateGraph:
     builder.add_edge("deploy_check", "deploy")
     builder.add_edge("deploy", END)
 
-    memory = MemorySaver()
-    return builder.compile(checkpointer=memory)
+    return builder.compile(checkpointer=_memory)

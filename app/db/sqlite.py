@@ -39,6 +39,7 @@ def init_db() -> None:
             syntax_valid INTEGER DEFAULT 0,
             business_valid INTEGER DEFAULT 0,
             verify_result TEXT,
+            parameters TEXT DEFAULT '[]',
             deployed_at TIMESTAMP,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -57,6 +58,11 @@ def init_db() -> None:
             FOREIGN KEY (sp_id) REFERENCES stored_procedures(id) ON DELETE CASCADE
         );
     """)
+    # 迁移：为已有数据库添加 parameters 列
+    try:
+        conn.execute("ALTER TABLE stored_procedures ADD COLUMN parameters TEXT DEFAULT '[]'")
+    except sqlite3.OperationalError:
+        pass  # 列已存在
     conn.commit()
     conn.close()
 
@@ -123,13 +129,13 @@ def get_messages(session_id: str) -> list[dict]:
 
 # --- Stored Procedures ---
 
-def save_sp(session_id: str, name: str, code: str) -> dict:
+def save_sp(session_id: str, name: str, code: str, parameters: str = '[]') -> dict:
     conn = _get_conn()
     sp_id = str(uuid.uuid4())
     conn.execute(
-        """INSERT INTO stored_procedures (id, session_id, name, code)
-           VALUES (?, ?, ?, ?)""",
-        (sp_id, session_id, name, code),
+        """INSERT INTO stored_procedures (id, session_id, name, code, parameters)
+           VALUES (?, ?, ?, ?, ?)""",
+        (sp_id, session_id, name, code, parameters),
     )
     conn.commit()
     row = conn.execute(
@@ -151,7 +157,7 @@ def get_sps(session_id: str) -> list[dict]:
 
 def update_sp(sp_id: str, **kwargs) -> None:
     allowed = {"name", "code", "status", "syntax_valid",
-               "business_valid", "verify_result", "deployed_at"}
+               "business_valid", "verify_result", "parameters", "deployed_at"}
     updates = {k: v for k, v in kwargs.items() if k in allowed}
     if not updates:
         return
@@ -176,6 +182,18 @@ def delete_sp(sp_id: str) -> None:
     conn.execute("DELETE FROM stored_procedures WHERE id = ?", (sp_id,))
     conn.commit()
     conn.close()
+
+
+def delete_sps_by_session(session_id: str) -> int:
+    """删除指定会话下所有 SP（级联删除校验 SQL）。返回删除数量。"""
+    conn = _get_conn()
+    cursor = conn.execute(
+        "DELETE FROM stored_procedures WHERE session_id = ?", (session_id,)
+    )
+    count = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return count
 
 
 # --- Verify Queries ---

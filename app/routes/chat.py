@@ -5,6 +5,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from app.db.sqlite import save_message, get_messages
 from app.agent.graph import create_graph
+from langgraph.types import Command, interrupt
 
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
@@ -15,6 +16,26 @@ class ChatRequest(BaseModel):
     action: str = "send"
 
 
+def _has_interrupt(state) -> bool:
+    """检查 StateSnapshot 是否有待处理的中断。"""
+    if state is None:
+        return False
+    if not state.tasks:
+        return False
+    for task in state.tasks:
+        if task.interrupts:
+            return True
+    return False
+
+
+def _get_interrupt_value(state):
+    """获取第一个中断的值。"""
+    for task in (state.tasks or []):
+        for iv in (task.interrupts or []):
+            return iv.value
+    return None
+
+
 @router.post("/stream")
 async def api_chat_stream(req: ChatRequest):
     """SSE 流式对话端点。"""
@@ -22,29 +43,69 @@ async def api_chat_stream(req: ChatRequest):
 
     async def event_stream():
         graph = create_graph()
-        thread_id = req.session_id
-        config = {"configurable": {"thread_id": thread_id}}
+        config = {"configurable": {"thread_id": req.session_id}}
 
         try:
             state = graph.get_state(config)
-            if state and state.values:
-                current_mode = state.values.get("mode", "clarify")
-            else:
-                current_mode = "clarify"
 
-            input_state = {
-                "session_id": req.session_id,
-                "user_input": req.message,
-                "mode": current_mode,
-                "requirements": state.values.get("requirements", "") if state and state.values else "",
-                "sp_list": state.values.get("sp_list", []) if state and state.values else [],
-            }
+            # 检测用户消息数（用于强制退出澄清阶段）
+            all_msgs = get_messages(req.session_id)
+            user_count = sum(1 for m in all_msgs if m["role"] == "user")
 
-            # 如果有 interrupt，resume
-            if state and state.interrupts:
-                graph.update_state(config, {"user_input": req.message})
-                events = graph.stream(None, config)
+            # 判断是否处于中断等待状态
+            if _has_interrupt(state):
+                interrupt_val = _get_interrupt_value(state)
+                itype = interrupt_val.get("type", "") if isinstance(interrupt_val, dict) else ""
+
+                # 如果澄清阶段超过 4 条用户消息，强制进入设计阶段
+                if itype == "clarify" and user_count >= 6:
+                    # 跳过 LLM 澄清，直接用 mode=design 重启 graph
+                    requirements = state.values.get("requirements", "") if state.values else ""
+                    new_input = {
+                        "session_id": req.session_id,
+                        "user_input": req.message,
+                        "mode": "design",
+                        "requirements": requirements,
+                        "design": "",
+                        "sp_list": [],
+                        "verify_results": [],
+                        "status": "",
+                        "error": "",
+                    }
+                    events = graph.stream(new_input, config)
+                else:
+                    events = graph.stream(Command(resume=req.message), config)
+            elif state and state.values:
+                # 继续既有会话
+                mode = state.values.get("mode", "clarify")
+                # 如果已有足够用户消息，强制设为 design 模式
+                if user_count >= 6:
+                    mode = "design"
+                input_state = {
+                    "session_id": req.session_id,
+                    "user_input": req.message,
+                    "mode": mode,
+                    "requirements": state.values.get("requirements", ""),
+                    "design": state.values.get("design", ""),
+                    "sp_list": state.values.get("sp_list", []),
+                    "verify_results": state.values.get("verify_results", []),
+                    "status": state.values.get("status", ""),
+                    "error": state.values.get("error", ""),
+                }
+                events = graph.stream(input_state, config)
             else:
+                # 全新会话
+                input_state = {
+                    "session_id": req.session_id,
+                    "user_input": req.message,
+                    "mode": "clarify",
+                    "requirements": "",
+                    "design": "",
+                    "sp_list": [],
+                    "verify_results": [],
+                    "status": "",
+                    "error": "",
+                }
                 events = graph.stream(input_state, config)
 
             assistant_response = ""
@@ -52,19 +113,63 @@ async def api_chat_stream(req: ChatRequest):
             for event in events:
                 for node_name, node_output in event.items():
                     if isinstance(node_output, dict):
+                        if node_output.get("error"):
+                            # 节点出错（如 LLM 响应解析失败）
+                            assistant_response = f"❌ 错误: {node_output['error']}"
+                            yield f"data: {json.dumps({'type': 'error', 'content': assistant_response})}\n\n"
+
                         if node_output.get("status") == "generated":
                             sp_list = node_output.get("sp_list", [])
-                            assistant_response = f"已生成 {len(sp_list)} 个存储过程，校验完毕。请查看右侧面板。\n"
+                            assistant_response = f"已生成 {len(sp_list)} 个存储过程。\n"
                             for sp in sp_list:
                                 assistant_response += f"- {sp['name']}\n"
+                            assistant_response += "\n正在校验..."
+
+                        elif node_output.get("status") in ("verified", "verify_failed"):
+                            v_results = node_output.get("verify_results", [])
+                            print(f"[DEBUG verify_result] status={node_output.get('status')}, v_results count={len(v_results)}", flush=True)
+                            for i, vr in enumerate(v_results):
+                                print(f"[DEBUG verify_result]   [{i}] sp_id={vr.get('sp_id','?')[:8]}, syntax_ok={vr.get('syntax_ok')}, biz_ok={vr.get('business_ok')}, details={len(vr.get('details',[]))}", flush=True)
+                            lines = ["\n--- 校验结果 ---"]
+                            if v_results:
+                                for vr in v_results:
+                                    sp_name = vr.get("sp_name", vr.get("sp_id", "")[:8])
+                                    syn = "✅" if vr.get("syntax_ok") else "❌"
+                                    biz = "✅" if vr.get("business_ok") else "❌"
+                                    lines.append(f"📄 {sp_name}")
+                                    lines.append(f"   {syn} 语法  {biz} 业务")
+                                    for d in vr.get("details", []):
+                                        if d.get("type") == "syntax" and not d.get("pass"):
+                                            lines.append(f"   语法错误: {d.get('error', '')[:120]}")
+                                        elif d.get("type") == "business":
+                                            mark = "✅" if d.get("pass") else "❌"
+                                            detail = d.get('data', d.get('error', ''))
+                                            detail_str = str(detail)[:120] if detail else ''
+                                            lines.append(f"   {mark} {d.get('query', '')}: {detail_str}")
+                            else:
+                                lines.append("⚠️ 校验结果为空，可能未生成存储过程")
+                            assistant_response = "\n".join(lines)
+                            yield f"data: {json.dumps({'type': 'verify_result', 'content': assistant_response, 'data': node_output})}\n\n"
 
                         yield f"data: {json.dumps({'node': node_name, 'data': node_output, 'type': 'update'})}\n\n"
+
+            # 流结束后检查是否产生了新的中断
+            new_state = graph.get_state(config)
+            if _has_interrupt(new_state):
+                interrupt_val = _get_interrupt_value(new_state)
+                if isinstance(interrupt_val, dict):
+                    itype = interrupt_val.get("type", "")
+                    if itype == "clarify":
+                        assistant_response = interrupt_val.get("question", "")
+                        yield f"data: {json.dumps({'type': 'question', 'content': assistant_response})}\n\n"
+                    elif itype == "design":
+                        assistant_response = interrupt_val.get("content", "")
+                        yield f"data: {json.dumps({'type': 'design', 'content': assistant_response})}\n\n"
 
             if not assistant_response:
                 assistant_response = "处理完成"
 
             save_message(req.session_id, "assistant", assistant_response)
-
             yield f"data: {json.dumps({'type': 'done', 'content': assistant_response})}\n\n"
 
         except Exception as e:

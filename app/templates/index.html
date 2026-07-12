@@ -4,9 +4,9 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>SP Generator — SAP B1 存储过程智能体</title>
-    <script src="https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js"></script>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/6.65.7/codemirror.min.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/codemirror.min.css">
     <link rel="stylesheet" href="/static/style.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/14.1.0/marked.min.js"></script>
 </head>
 <body>
     <header id="topbar">
@@ -35,11 +35,8 @@
         </section>
 
         <section id="right-panel">
-            <h2>存储过程列表</h2>
+            <h2>存储过程 <button id="btn-refresh-sp" onclick="loadSpList()" style="float:right;font-size:11px;padding:2px 8px;">🔄 刷新</button></h2>
             <div id="sp-list"></div>
-
-            <h2>校验 SQL 列表</h2>
-            <div id="verify-list"></div>
 
             <div id="deploy-actions">
                 <button id="btn-precheck" onclick="precheckDeploy()">🔍 一键预检</button>
@@ -49,10 +46,29 @@
         </section>
     </main>
 
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/6.65.7/codemirror.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/6.65.7/mode/sql/sql.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/codemirror.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.18/mode/sql/sql.min.js"></script>
     <script>
+    // 配置 marked（CDN 可能加载失败，做好容错）
+    if (typeof marked !== 'undefined') {
+        marked.setOptions({breaks: true, gfm: true});
+    }
+
+    function renderMarkdown(text) {
+        if (!text) return '';
+        if (typeof marked === 'undefined') return escapeHtml(text).replace(/\n/g, '<br>');
+        try {
+            return marked.parse(text);
+        } catch(e) {
+            return escapeHtml(text).replace(/\n/g, '<br>');
+        }
+    }
+
     let currentSessionId = '';
+    let cmInstances = {};  // 缓存 CodeMirror 实例
+    let lastVerifyResults = {};  // 缓存最近一次校验结果 {sp_id: result}
+
+    // ====== 会话管理 ======
 
     async function loadSessions() {
         const r = await fetch('/api/sessions');
@@ -68,14 +84,40 @@
         if (data.sessions.length > 0) {
             currentSessionId = data.sessions[0].id;
             sel.value = currentSessionId;
-            loadMessages();
-            loadSpList();
+        } else {
+            await createSessionDefault();
+        }
+        loadMessages();
+        loadSpList();
+    }
+
+    async function createSessionDefault() {
+        await fetch('/api/sessions', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({name: '新会话'}),
+        });
+        const r = await fetch('/api/sessions');
+        const data = await r.json();
+        if (data.sessions.length > 0) {
+            currentSessionId = data.sessions[0].id;
+            const sel = document.getElementById('session-select');
+            sel.innerHTML = '';
+            for (const s of data.sessions) {
+                const opt = document.createElement('option');
+                opt.value = s.id;
+                opt.textContent = s.name;
+                sel.appendChild(opt);
+            }
+            sel.value = currentSessionId;
         }
     }
 
     function switchSession() {
         currentSessionId = document.getElementById('session-select').value;
         document.getElementById('chat-messages').innerHTML = '';
+        cmInstances = {};
+        lastVerifyResults = {};
         loadMessages();
         loadSpList();
     }
@@ -87,7 +129,16 @@
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({name}),
         });
-        loadSessions();
+        await loadSessions();
+        const r2 = await fetch('/api/sessions');
+        const data2 = await r2.json();
+        if (data2.sessions.length > 0) {
+            currentSessionId = data2.sessions[0].id;
+            document.getElementById('session-select').value = currentSessionId;
+            cmInstances = {};
+            loadMessages();
+            loadSpList();
+        }
     }
 
     async function deleteCurrentSession() {
@@ -96,8 +147,11 @@
         currentSessionId = '';
         document.getElementById('chat-messages').innerHTML = '';
         document.getElementById('sp-list').innerHTML = '';
+        cmInstances = {};
         loadSessions();
     }
+
+    // ====== 消息 ======
 
     async function loadMessages() {
         if (!currentSessionId) return;
@@ -106,11 +160,22 @@
         const container = document.getElementById('chat-messages');
         container.innerHTML = '';
         for (const m of data.messages) {
-            const div = document.createElement('div');
-            div.className = `message ${m.role}`;
-            div.textContent = m.content;
-            container.appendChild(div);
+            appendMessage(container, m.role, m.content);
         }
+        container.scrollTop = container.scrollHeight;
+    }
+
+    function appendMessage(container, role, content, html) {
+        const div = document.createElement('div');
+        div.className = `message ${role}`;
+        if (html) {
+            div.innerHTML = html;
+        } else if (role === 'assistant') {
+            div.innerHTML = renderMarkdown(content);
+        } else {
+            div.textContent = content;
+        }
+        container.appendChild(div);
         container.scrollTop = container.scrollHeight;
     }
 
@@ -118,15 +183,24 @@
         event.preventDefault();
         const input = document.getElementById('chat-input');
         const message = input.value.trim();
-        if (!message || !currentSessionId) return;
+        if (!message) return;
+        if (!currentSessionId) {
+            alert('请先创建会话');
+            return;
+        }
 
         const container = document.getElementById('chat-messages');
-        const userDiv = document.createElement('div');
-        userDiv.className = 'message user';
-        userDiv.textContent = message;
-        container.appendChild(userDiv);
-        container.scrollTop = container.scrollHeight;
+
+        // 显示用户消息
+        appendMessage(container, 'user', message);
         input.value = '';
+
+        // 创建 assistant 占位 div
+        const assistantDiv = document.createElement('div');
+        assistantDiv.className = 'message assistant';
+        assistantDiv.textContent = '思考中...';
+        container.appendChild(assistantDiv);
+        container.scrollTop = container.scrollHeight;
 
         const r = await fetch('/api/chat/stream', {
             method: 'POST',
@@ -146,97 +220,470 @@
             const lines = buffer.split('\n');
             buffer = lines.pop();
             for (const line of lines) {
-                if (line.startsWith('data: ')) {
-                    try {
-                        const data = JSON.parse(line.slice(6));
-                        if (data.type === 'done') {
-                            assistantText = data.content;
-                            const div = document.createElement('div');
-                            div.className = 'message assistant';
-                            div.textContent = data.content;
-                            container.appendChild(div);
-                            loadSpList();
-                        } else if (data.type === 'error') {
-                            const div = document.createElement('div');
-                            div.className = 'message error';
-                            div.textContent = data.content;
-                            container.appendChild(div);
+                if (!line.startsWith('data: ')) continue;
+                try {
+                    const data = JSON.parse(line.slice(6));
+
+                    if (data.type === 'question') {
+                        assistantText = data.content;
+                        assistantDiv.innerHTML = renderMarkdown(data.content);
+                    } else if (data.type === 'design') {
+                        assistantText = data.content;
+                        assistantDiv.innerHTML = '<strong>📋 设计方案：</strong><br><pre style="white-space:pre-wrap;font-size:13px;margin-top:4px;">' + escapeHtml(data.content) + '</pre>';
+                    } else if (data.type === 'verify_result') {
+                        assistantText = data.content;
+                        // 渲染校验结果到聊天区
+                        assistantDiv.innerHTML = renderVerifyResult(data.content, data.data);
+                        // 同步更新右侧 SP 卡片：状态标签 + 内联校验结果
+                        const vResults = (data.data && data.data.verify_results) ? data.data.verify_results : [];
+                        for (const vr of vResults) {
+                            lastVerifyResults[vr.sp_id] = vr;
+                            refreshSpStatusInPlace(vr.sp_id, vr);
+                            showSpVerifyResult(vr.sp_id, vr);
                         }
-                    } catch(e) {}
-                }
+                    } else if (data.type === 'update') {
+                        loadSpList();
+                    } else if (data.type === 'done') {
+                        if (!assistantText) {
+                            assistantText = data.content;
+                            assistantDiv.innerHTML = renderMarkdown(data.content);
+                        }
+                        loadSpList();
+                    } else if (data.type === 'error') {
+                        assistantDiv.className = 'message error';
+                        assistantDiv.innerHTML = renderMarkdown(data.content);
+                    }
+                } catch(e) {}
             }
             container.scrollTop = container.scrollHeight;
         }
+
+        if (!assistantText && assistantDiv.textContent === '思考中...') {
+            assistantDiv.textContent = '处理完成';
+        }
     }
+
+    function renderVerifyResult(text, nodeData) {
+        // 使用结构化数据渲染校验结果
+        let html = '<strong>🔍 校验结果</strong>';
+        const vResults = (nodeData && nodeData.verify_results) ? nodeData.verify_results : [];
+        if (vResults.length > 0) {
+            for (const vr of vResults) {
+                const spName = escapeHtml(vr.sp_name || vr.sp_id || '?');
+                const synIcon = vr.syntax_ok ? '✅' : '❌';
+                const bizIcon = vr.business_ok ? '✅' : '❌';
+                html += `<div class="verify-chat-card">`;
+                html += `<div class="verify-chat-title">📄 ${spName}</div>`;
+                html += `<div class="verify-chat-summary">${synIcon} 语法 &nbsp; ${bizIcon} 业务</div>`;
+                if (vr.details && vr.details.length > 0) {
+                    html += '<div class="verify-chat-details">';
+                    for (const d of vr.details) {
+                        if (d.type === 'syntax' && !d.pass) {
+                            html += `<div class="vcd-row fail">❌ 语法错误: ${escapeHtml((d.error||'').substring(0,150))}</div>`;
+                        } else if (d.type === 'business') {
+                            const mark = d.pass ? '✅' : '❌';
+                            const detail = d.data ? ('数据: ' + escapeHtml(JSON.stringify(d.data).substring(0,100))) : (d.error ? escapeHtml(String(d.error).substring(0,150)) : '');
+                            html += `<div class="vcd-row ${d.pass?'pass':'fail'}">${mark} ${escapeHtml(d.query||'')}: ${detail}</div>`;
+                        }
+                    }
+                    html += '</div>';
+                }
+                html += '</div>';
+            }
+        } else {
+            html += '<pre style="white-space:pre-wrap;font-size:13px;margin-top:4px;background:#f5f6fa;padding:8px;border-radius:4px;">' + escapeHtml(text) + '</pre>';
+        }
+        return html;
+    }
+
+    // ====== 存储过程列表（含校验 SQL 组） ======
 
     async function loadSpList() {
         if (!currentSessionId) return;
-        const r = await fetch(`/api/sp/${currentSessionId}`);
-        const data = await r.json();
         const container = document.getElementById('sp-list');
-        if (data.procedures.length === 0) {
-            container.innerHTML = '<p style="color:#636e72;font-size:13px;">暂无存储过程</p>';
+
+        const spR = await fetch(`/api/sp/${currentSessionId}`);
+        const spData = await spR.json();
+        if (!spData.procedures || spData.procedures.length === 0) {
+            container.innerHTML = '<p class="empty-hint">暂无存储过程</p>';
             return;
         }
-        container.innerHTML = data.procedures.map(sp => `
-            <div class="sp-card">
-                <div class="sp-header">
-                    <span class="sp-name">${sp.name}</span>
-                    <span class="sp-status ${sp.status || 'draft'}">${sp.status || 'draft'}</span>
-                </div>
-                <div class="sp-actions">
-                    <button onclick="toggleSpCode('${sp.id}')">▸ 代码</button>
-                    <button onclick="editSp('${sp.id}')">✎ 编辑</button>
-                    <button onclick="verifySp('${sp.id}')">✓ 校验</button>
-                </div>
-                <div class="sp-code" id="sp-code-${sp.id}">
-                    <textarea id="sp-editor-${sp.id}" class="sp-code-editor" readonly>${escapeHtml(sp.code)}</textarea>
-                </div>
-            </div>
-        `).join('');
-    }
 
-    function escapeHtml(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+        let html = '';
+        for (const sp of spData.procedures) {
+            const statusLabel = {draft:'草稿', verified:'已校验', verify_failed:'校验失败', deployed:'已部署'}[sp.status] || sp.status;
+            const statusCls = sp.status || 'draft';
+            const synIcon = sp.syntax_valid ? '✅' : (sp.syntax_valid === 0 ? '❌' : '⬜');
+            const bizIcon = sp.business_valid ? '✅' : (sp.business_valid === 0 ? '❌' : '⬜');
 
-    function toggleSpCode(spId) {
-        const el = document.getElementById(`sp-code-${spId}`);
-        el.classList.toggle('open');
-        if (el.classList.contains('open')) {
-            setTimeout(() => initCodeMirror(`sp-editor-${spId}`), 100);
+            // 获取该校验 SQL
+            const vR = await fetch(`/api/verify/${currentSessionId}/sp/${sp.id}`);
+            const vData = await vR.json();
+            const vqs = vData.verify_queries || [];
+
+            html += `
+            <div class="sp-group">
+                <div class="sp-group-header" onclick="toggleSpGroup('sp-group-${sp.id}')">
+                    <span class="toggle-arrow" id="arrow-${sp.id}">▸</span>
+                    <span class="sp-group-name">📄 ${escapeHtml(sp.name)}</span>
+                    <span class="sp-group-badges">
+                        <span>语法:${synIcon}</span>
+                        <span>业务:${bizIcon}</span>
+                    </span>
+                    <span class="sp-status ${statusCls}">${statusLabel}</span>
+                </div>
+                <div class="sp-group-body collapsed" id="sp-group-${sp.id}">
+                    <div class="sp-code-section">
+                        <div class="sp-code-header" onclick="toggleSpCode('sp-code-body-${sp.id}')">
+                            <span class="toggle-arrow" id="sp-code-arrow-${sp.id}">▸</span>
+                            <span>📝 SQL 代码</span>
+                        </div>
+                        <div class="sp-code-body collapsed" id="sp-code-body-${sp.id}">
+                            <textarea id="sp-editor-${sp.id}" class="sp-code-editor">${escapeHtml(sp.code)}</textarea>
+                        </div>
+                    </div>
+                    ${(() => {
+                        let paramsHtml = '';
+                        try {
+                            const params = JSON.parse(sp.parameters || '[]');
+                            if (params.length > 0) {
+                                paramsHtml = `
+                                <div class="param-panel">
+                                    <div class="param-panel-header" onclick="toggleParamPanel('param-block-${sp.id}')">
+                                        <span class="toggle-arrow" id="param-arrow-${sp.id}">▸</span>
+                                        <span>⚙ 参数（${params.length} 个）</span>
+                                    </div>
+                                    <div class="param-panel-body collapsed" id="param-block-${sp.id}">
+                                        ${params.map(p => `
+                                        <div class="param-row">
+                                            <label class="param-label">${escapeHtml(p.name)} <span class="param-type">${escapeHtml(p.type)}</span></label>
+                                            <input class="param-input" id="param-${sp.id}-${escapeHtml(p.name)}"
+                                                   type="text" value="${escapeHtml(p.default || '')}"
+                                                   placeholder="${escapeHtml(p.default || '输入值...')}">
+                                        </div>
+                                        `).join('')}
+                                    </div>
+                                </div>`;
+                            }
+                        } catch(e) {}
+                        return paramsHtml;
+                    })()}
+                    <div class="verify-inline">
+                        <div class="verify-inline-header" onclick="toggleVerifyBlock('vq-block-${sp.id}')">
+                            <span class="toggle-arrow" id="vq-arrow-${sp.id}">▸</span>
+                            <span>📋 校验 SQL（${vqs.length} 条）</span>
+                        </div>
+                        <div class="verify-inline-body collapsed" id="vq-block-${sp.id}">
+                            ${vqs.length === 0 ? '<p class="empty-hint">暂无校验 SQL</p>' : vqs.map(vq => {
+                                const passIcon = vq.status === 'pass' ? '✅' : (vq.status === 'fail' ? '❌' : '⬜');
+                                const statusCls = vq.status || 'pending';
+                                return `
+                                <div class="vq-inline-card" id="vq-card-${vq.id}">
+                                    <div class="vq-inline-header" onclick="toggleVqCard('vq-body-${vq.id}')">
+                                        <span class="toggle-arrow" id="vq-card-arrow-${vq.id}">▸</span>
+                                        <span id="vq-icon-${vq.id}">${passIcon}</span>
+                                        <span>${escapeHtml(vq.name)}</span>
+                                        <span class="verify-status ${statusCls}" id="vq-status-${vq.id}">${vq.status||'pending'}</span>
+                                    </div>
+                                    <div class="vq-card-body collapsed" id="vq-body-${vq.id}">
+                                        ${vq.compare_columns ? `<div class="vq-meta">比对列: ${escapeHtml(vq.compare_columns)}</div>` : ''}
+                                        <textarea id="vq-editor-${vq.id}" class="vq-code-editor">${escapeHtml(vq.sql_code)}</textarea>
+                                    </div>
+                                    <div id="vq-result-${vq.id}">${vq.result_detail ? `<pre class="vq-result-detail">${escapeHtml(vq.result_detail)}</pre>` : ''}</div>
+                                </div>`;
+                            }).join('')}
+                        </div>
+                    </div>
+                    <div class="sp-actions">
+                        <button class="verify-btn" onclick="verifySp('${sp.id}')">🔍 校验</button>
+                        <button class="save-verify-btn" onclick="saveAndVerifySp('${sp.id}')">💾 校验+保存</button>
+                        <span class="sp-action-status" id="sp-action-status-${sp.id}"></span>
+                    </div>
+                    <div class="sp-verify-result" id="sp-verify-result-${sp.id}" style="display:none;"></div>
+                </div>
+            </div>`;
         }
-    }
+        container.innerHTML = html;
 
-    function editSp(spId) {
-        const ta = document.getElementById(`sp-editor-${spId}`);
-        ta.readOnly = !ta.readOnly;
-        if (!ta.readOnly) {
-            ta.style.background = '#fffbe6';
-            const saveBtn = document.createElement('button');
-            saveBtn.textContent = '保存';
-            saveBtn.className = 'save-btn';
-            saveBtn.onclick = async () => {
-                const name = prompt('存储过程名称:', '');
-                if (name) {
-                    await fetch(`/api/sp/${spId}`, {
-                        method: 'PUT',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({name, code: ta.value}),
-                    });
-                    ta.readOnly = true;
-                    ta.style.background = '';
-                    saveBtn.remove();
-                    loadSpList();
+        // 初始化 CodeMirror（仅对已展开的代码块，折叠的等展开时再初始化）
+        setTimeout(() => {
+            for (const sp of spData.procedures) {
+                const codeBody = document.getElementById('sp-code-body-' + sp.id);
+                if (codeBody && !codeBody.classList.contains('collapsed')) {
+                    initCodeMirror(`sp-editor-${sp.id}`, false);
                 }
-            };
-            ta.parentElement.appendChild(saveBtn);
+            }
+        }, 100);
+
+        // 恢复缓存的校验结果到 SP 卡片中
+        setTimeout(() => {
+            for (const sp of spData.procedures) {
+                const cached = lastVerifyResults[sp.id];
+                if (cached) {
+                    refreshSpStatusInPlace(sp.id, cached);
+                    showSpVerifyResult(sp.id, cached);
+                }
+            }
+        }, 200);
+    }
+
+    // ====== SP 组折叠/展开 ======
+
+    function toggleSpGroup(groupId) {
+        const body = document.getElementById(groupId);
+        if (!body) return;
+        body.classList.toggle('collapsed');
+        // 更新箭头
+        const spId = groupId.replace('sp-group-', '');
+        const arrow = document.getElementById('arrow-' + spId);
+        if (arrow) {
+            arrow.textContent = body.classList.contains('collapsed') ? '▸' : '▾';
         }
     }
+
+    function toggleSpCode(bodyId) {
+        const body = document.getElementById(bodyId);
+        if (!body) return;
+        const wasCollapsed = body.classList.contains('collapsed');
+        body.classList.toggle('collapsed');
+        const spId = bodyId.replace('sp-code-body-', '');
+        const arrow = document.getElementById('sp-code-arrow-' + spId);
+        if (arrow) {
+            arrow.textContent = body.classList.contains('collapsed') ? '▸' : '▾';
+        }
+        // 展开时初始化/刷新 CodeMirror
+        if (wasCollapsed) {
+            setTimeout(() => {
+                const key = 'sp-editor-' + spId;
+                const cm = cmInstances[key];
+                if (cm) {
+                    cm.refresh();
+                } else {
+                    initCodeMirror(key, false);
+                }
+            }, 100);
+        }
+    }
+
+    function toggleVerifyBlock(blockId) {
+        const body = document.getElementById(blockId);
+        if (!body) return;
+        const wasCollapsed = body.classList.contains('collapsed');
+        body.classList.toggle('collapsed');
+        const spId = blockId.replace('vq-block-', '');
+        const arrow = document.getElementById('vq-arrow-' + spId);
+        if (arrow) {
+            arrow.textContent = body.classList.contains('collapsed') ? '▸' : '▾';
+        }
+        // 展开时仅更新已存在的 CodeMirror 实例（各条 SQL 由 toggleVqCard 单独初始化）
+        if (wasCollapsed) {
+            requestAnimationFrame(() => {
+                setTimeout(() => {
+                    body.querySelectorAll('.CodeMirror').forEach(el => {
+                        el.CodeMirror && el.CodeMirror.refresh();
+                    });
+                }, 50);
+            });
+        }
+    }
+
+    function toggleParamPanel(blockId) {
+        const body = document.getElementById(blockId);
+        if (!body) return;
+        body.classList.toggle('collapsed');
+        const spId = blockId.replace('param-block-', '');
+        const arrow = document.getElementById('param-arrow-' + spId);
+        if (arrow) {
+            arrow.textContent = body.classList.contains('collapsed') ? '▸' : '▾';
+        }
+    }
+
+    function collectParams(spId) {
+        // 从 DOM 中收集该 SP 的参数值
+        const params = {};
+        const inputs = document.querySelectorAll(`[id^="param-${spId}-"]`);
+        for (const inp of inputs) {
+            const name = inp.id.replace(`param-${spId}-`, '');
+            if (inp.value.trim()) {
+                params[name] = inp.value.trim();
+            }
+        }
+        return params;
+    }
+
+    function toggleVqCard(bodyId) {
+        const body = document.getElementById(bodyId);
+        if (!body) return;
+        const wasCollapsed = body.classList.contains('collapsed');
+        body.classList.toggle('collapsed');
+        const vqId = bodyId.replace('vq-body-', '');
+        const arrow = document.getElementById('vq-card-arrow-' + vqId);
+        if (arrow) {
+            arrow.textContent = body.classList.contains('collapsed') ? '▸' : '▾';
+        }
+        // 展开时初始化 CodeMirror（等浏览器布局完成）
+        if (wasCollapsed) {
+            requestAnimationFrame(() => {
+                setTimeout(() => {
+                    const ta = body.querySelector('.vq-code-editor');
+                    if (ta) {
+                        initCodeMirror(ta.id, false);
+                        const cm = cmInstances[ta.id];
+                        if (cm) cm.refresh();
+                    }
+                }, 50);
+            });
+        }
+    }
+
+    // ====== SP 校验 / 保存+校验 ======
 
     async function verifySp(spId) {
-        const r = await fetch(`/api/verify/business/${spId}`, {method: 'POST'});
-        const data = await r.json();
-        alert('校验结果:\n' + JSON.stringify(data.results, null, 2));
+        const statusEl = document.getElementById('sp-action-status-' + spId);
+        if (!statusEl) return;
+        statusEl.textContent = '⏳ 校验中...';
+        statusEl.className = 'sp-action-status running';
+
+        const editorKey = 'sp-editor-' + spId;
+        const cm = cmInstances[editorKey];
+        const code = cm ? cm.getValue() : '';
+
+        try {
+            const params = collectParams(spId);
+            const r = await fetch(`/api/verify/sp/${spId}`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({code: code, params: Object.keys(params).length > 0 ? params : undefined}),
+            });
+            const data = await r.json();
+            if (data.ok) {
+                refreshSpStatusInPlace(spId, data.result);
+                showSpVerifyResult(spId, data.result);
+                statusEl.textContent = '✅ 校验完成';
+                statusEl.className = 'sp-action-status success';
+            } else {
+                statusEl.textContent = '❌ ' + (data.message || '校验失败');
+                statusEl.className = 'sp-action-status fail';
+            }
+        } catch(e) {
+            statusEl.textContent = '❌ 请求失败: ' + e.message;
+            statusEl.className = 'sp-action-status fail';
+        }
     }
+
+    async function saveAndVerifySp(spId) {
+        const statusEl = document.getElementById('sp-action-status-' + spId);
+        if (!statusEl) return;
+        statusEl.textContent = '⏳ 保存并校验中...';
+        statusEl.className = 'sp-action-status running';
+
+        const editorKey = 'sp-editor-' + spId;
+        const cm = cmInstances[editorKey];
+        const code = cm ? cm.getValue() : '';
+
+        try {
+            const params = collectParams(spId);
+            // 1. 保存 SP 代码
+            await fetch(`/api/sp/${spId}`, {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({code: code}),
+            });
+
+            // 2. 校验
+            const r = await fetch(`/api/verify/sp/${spId}`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({code: code, params: Object.keys(params).length > 0 ? params : undefined}),
+            });
+            const data = await r.json();
+            if (data.ok) {
+                refreshSpStatusInPlace(spId, data.result);
+                showSpVerifyResult(spId, data.result);
+                statusEl.textContent = '✅ 保存并校验完成';
+                statusEl.className = 'sp-action-status success';
+            } else {
+                statusEl.textContent = '❌ ' + (data.message || '校验失败');
+                statusEl.className = 'sp-action-status fail';
+            }
+        } catch(e) {
+            statusEl.textContent = '❌ 请求失败: ' + e.message;
+            statusEl.className = 'sp-action-status fail';
+        }
+    }
+
+    function refreshSpStatusInPlace(spId, result) {
+        // 更新 SP 头部状态标签
+        const groupBody = document.getElementById('sp-group-' + spId);
+        if (!groupBody) return;
+        const spGroup = groupBody.closest('.sp-group');
+        if (!spGroup) return;
+
+        // 更新状态标签
+        const statusEl = spGroup.querySelector('.sp-status');
+        if (statusEl) {
+            const allOk = result.syntax_ok && result.business_ok;
+            statusEl.textContent = allOk ? '已校验' : '校验失败';
+            statusEl.className = 'sp-status ' + (allOk ? 'verified' : 'verify_failed');
+        }
+
+        // 更新语法/业务图标
+        const badges = spGroup.querySelectorAll('.sp-group-badges span');
+        if (badges.length >= 2) {
+            badges[0].textContent = '语法:' + (result.syntax_ok ? '✅' : '❌');
+            badges[1].textContent = '业务:' + (result.business_ok ? '✅' : '❌');
+        }
+
+        // 更新校验 SQL 状态（遍历 details 中的 business 项）
+        if (result.details) {
+            for (const d of result.details) {
+                if (d.type === 'business' && d.query_id) {
+                    const vqStatus = document.getElementById('vq-status-' + d.query_id);
+                    const vqIcon = document.getElementById('vq-icon-' + d.query_id);
+                    const vqResult = document.getElementById('vq-result-' + d.query_id);
+                    if (vqStatus) {
+                        vqStatus.textContent = d.pass ? 'pass' : 'fail';
+                        vqStatus.className = 'verify-status ' + (d.pass ? 'pass' : 'fail');
+                    }
+                    if (vqIcon) {
+                        vqIcon.textContent = d.pass ? '✅' : '❌';
+                    }
+                    if (vqResult && d.error) {
+                        vqResult.innerHTML = '<pre class="vq-result-detail">' + escapeHtml(String(d.error).substring(0, 300)) + '</pre>';
+                    } else if (vqResult && d.data) {
+                        vqResult.innerHTML = '<pre class="vq-result-detail">' + escapeHtml(JSON.stringify(d.data).substring(0, 300)) + '</pre>';
+                    }
+                }
+            }
+        }
+    }
+
+    function showSpVerifyResult(spId, result) {
+        const container = document.getElementById('sp-verify-result-' + spId);
+        if (!container) return;
+
+        const synIcon = result.syntax_ok ? '✅' : '❌';
+        const bizIcon = result.business_ok ? '✅' : '❌';
+        let html = `<div class="spr-summary">${synIcon} 语法 &nbsp; ${bizIcon} 业务</div>`;
+
+        if (result.details && result.details.length > 0) {
+            html += '<div class="spr-details">';
+            for (const d of result.details) {
+                if (d.type === 'syntax' && !d.pass) {
+                    html += `<div class="spr-row fail">❌ 语法错误: ${escapeHtml((d.error||'').substring(0,200))}</div>`;
+                } else if (d.type === 'business') {
+                    const mark = d.pass ? '✅' : '❌';
+                    const detail = d.data ? ('数据: ' + escapeHtml(JSON.stringify(d.data).substring(0,120))) : (d.error ? escapeHtml(String(d.error).substring(0,200)) : '');
+                    html += `<div class="spr-row ${d.pass?'pass':'fail'}">${mark} ${escapeHtml(d.query||'')}: ${detail}</div>`;
+                }
+            }
+            html += '</div>';
+        }
+        container.innerHTML = html;
+        container.style.display = 'block';
+    }
+
+    // ====== 预检 / 部署 ======
 
     async function precheckDeploy() {
         if (!currentSessionId) return;
@@ -247,7 +694,7 @@
             rd.innerHTML = '✅ 预检通过，可以部署';
             document.getElementById('btn-deploy').disabled = false;
         } else {
-            rd.innerHTML = data.results.map(r => r.syntax_ok ? `✅ ${r.name}` : `❌ ${r.name}: ${r.error}`).join('<br>');
+            rd.innerHTML = (data.results || []).map(r => r.syntax_ok ? `✅ ${r.name}` : `❌ ${r.name}: ${r.error}`).join('<br>');
             document.getElementById('btn-deploy').disabled = true;
         }
     }
@@ -260,19 +707,32 @@
         if (data.ok) {
             rd.innerHTML = '🚀 全部部署成功！';
         } else {
-            rd.innerHTML = data.results.map(r => r.success ? `✅ ${r.name}` : `❌ ${r.name}: ${r.error}`).join('<br>');
+            rd.innerHTML = (data.results || []).map(r => r.success ? `✅ ${r.name}` : `❌ ${r.name}: ${r.error}`).join('<br>');
         }
     }
 
-    function initCodeMirror(textareaId) {
+    // ====== 工具函数 ======
+
+    function escapeHtml(s) {
+        if (!s) return '';
+        return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+
+    function initCodeMirror(textareaId, readOnly) {
         const ta = document.getElementById(textareaId);
-        if (!ta || ta.nextSibling?.classList?.contains('CodeMirror')) return;
-        CodeMirror.fromTextArea(ta, {
+        if (!ta) return;
+        // 如果已经有 CM 实例则跳过
+        if (cmInstances[textareaId]) return;
+        // 如果 DOM 已挂 CM 则跳过
+        if (ta.nextSibling && ta.nextSibling.classList && ta.nextSibling.classList.contains('CodeMirror')) return;
+
+        const cm = CodeMirror.fromTextArea(ta, {
             mode: 'text/x-sql',
             lineNumbers: true,
-            readOnly: ta.readOnly,
+            readOnly: readOnly || false,
             theme: 'default',
         });
+        cmInstances[textareaId] = cm;
     }
 
     async function checkDbStatus() {

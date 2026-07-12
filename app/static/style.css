@@ -11,43 +11,226 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 
 main { display: flex; flex: 1; overflow: hidden; }
 
-#chat-panel { flex: 6; display: flex; flex-direction: column; border-right: 1px solid #dfe6e9; }
+/* ====== Chat Panel ====== */
+#chat-panel { flex: 0 0 50%; width: 50%; display: flex; flex-direction: column; border-right: 1px solid #dfe6e9; }
 #chat-messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
-#chat-messages .message { max-width: 80%; padding: 10px 14px; border-radius: 12px; line-height: 1.5; font-size: 14px; white-space: pre-wrap; word-break: break-word; }
-#chat-messages .user { align-self: flex-end; background: #6c5ce7; color: #fff; }
+#chat-messages .message { max-width: 80%; padding: 10px 14px; border-radius: 12px; line-height: 1.5; font-size: 14px; word-break: break-word; }
+#chat-messages .user { align-self: flex-end; background: #6c5ce7; color: #fff; white-space: pre-wrap; }
 #chat-messages .assistant { align-self: flex-start; background: #fff; border: 1px solid #dfe6e9; }
-#chat-messages .system { align-self: center; font-size: 12px; color: #636e72; }
+#chat-messages .system { align-self: center; font-size: 12px; color: #636e72; white-space: pre-wrap; }
 #chat-messages .error { align-self: flex-start; background: #ff7675; color: #fff; }
+
+/* ====== Markdown 渲染样式（assistant 消息内） ====== */
+.message.assistant p { margin: 0 0 8px; }
+.message.assistant p:last-child { margin-bottom: 0; }
+.message.assistant ul, .message.assistant ol { margin: 4px 0 8px; padding-left: 20px; }
+.message.assistant li { margin: 2px 0; }
+.message.assistant code { background: #f0f0f5; padding: 2px 6px; border-radius: 3px; font-size: 13px; font-family: "Cascadia Code", "Fira Code", Consolas, monospace; }
+.message.assistant pre { background: #2d3436; color: #dfe6e9; padding: 10px 14px; border-radius: 6px; overflow-x: auto; margin: 8px 0; font-size: 13px; line-height: 1.5; }
+.message.assistant pre code { background: none; padding: 0; border-radius: 0; font-size: inherit; color: inherit; }
+.message.assistant blockquote { border-left: 3px solid #6c5ce7; padding: 4px 12px; margin: 8px 0; color: #636e72; background: #f8f9fc; border-radius: 0 4px 4px 0; }
+.message.assistant table { border-collapse: collapse; margin: 8px 0; font-size: 13px; width: 100%; }
+.message.assistant th, .message.assistant td { border: 1px solid #dfe6e9; padding: 6px 10px; text-align: left; }
+.message.assistant th { background: #f5f6fa; font-weight: 600; }
+.message.assistant h1, .message.assistant h2, .message.assistant h3, .message.assistant h4 { margin: 12px 0 6px; font-weight: 600; }
+.message.assistant h1 { font-size: 18px; }
+.message.assistant h2 { font-size: 16px; }
+.message.assistant h3 { font-size: 15px; }
+.message.assistant h4 { font-size: 14px; }
+.message.assistant hr { border: none; border-top: 1px solid #dfe6e9; margin: 12px 0; }
+.message.assistant a { color: #6c5ce7; text-decoration: underline; }
+.message.assistant strong { font-weight: 600; }
+.message.assistant em { font-style: italic; }
+.message.assistant img { max-width: 100%; border-radius: 4px; }
 #chat-form { display: flex; padding: 12px; gap: 8px; border-top: 1px solid #dfe6e9; background: #fff; }
 #chat-form textarea { flex: 1; padding: 8px; border: 1px solid #dfe6e9; border-radius: 8px; resize: none; font-size: 14px; }
 #chat-form button { padding: 8px 16px; background: #6c5ce7; color: #fff; border: none; border-radius: 8px; cursor: pointer; }
 
-#right-panel { flex: 4; padding: 16px; overflow-y: auto; }
-#right-panel h2 { font-size: 14px; color: #636e72; margin: 12px 0 8px; padding-bottom: 4px; border-bottom: 1px solid #dfe6e9; }
+/* ====== Right Panel ====== */
+#right-panel { flex: 0 0 50%; width: 50%; padding: 16px; overflow-y: auto; display: flex; flex-direction: column; }
+#right-panel h2 { font-size: 14px; color: #636e72; margin: 0 0 8px; padding-bottom: 4px; border-bottom: 1px solid #dfe6e9; }
 #right-panel h2:first-child { margin-top: 0; }
 
-.sp-card { background: #fff; border: 1px solid #dfe6e9; border-radius: 8px; padding: 12px; margin-bottom: 8px; }
-.sp-card .sp-header { display: flex; justify-content: space-between; align-items: center; }
-.sp-card .sp-name { font-weight: 600; font-size: 14px; }
-.sp-card .sp-status { font-size: 12px; padding: 2px 8px; border-radius: 12px; }
+/* ====== SP Group（折叠卡片） ====== */
+.sp-group { background: #fff; border: 1px solid #dfe6e9; border-radius: 8px; margin-bottom: 8px; overflow: hidden; }
+.sp-group-header {
+    display: flex; align-items: center; gap: 8px; padding: 10px 12px;
+    cursor: pointer; user-select: none;
+    background: #f8f9fc; border-bottom: 1px solid #dfe6e9;
+}
+.sp-group-header:hover { background: #eef0f5; }
+.sp-group-header .toggle-arrow { font-size: 12px; color: #636e72; width: 14px; }
+.sp-group-name { font-weight: 600; font-size: 14px; flex: 1; }
+.sp-group-badges { display: flex; gap: 10px; font-size: 12px; color: #636e72; }
+.sp-group-body { padding: 12px; }
+.sp-group-body.collapsed { display: none; }
+
+/* SP 状态标签 */
+.sp-status { font-size: 11px; padding: 2px 8px; border-radius: 12px; white-space: nowrap; }
 .sp-status.draft { background: #ffeaa7; color: #d63031; }
 .sp-status.verified { background: #55efc4; color: #00b894; }
+.sp-status.verify_failed { background: #fab1a0; color: #d63031; }
 .sp-status.deployed { background: #74b9ff; color: #0984e3; }
-.sp-card .sp-actions { display: flex; gap: 8px; margin-top: 8px; }
-.sp-card .sp-actions button, .save-btn { padding: 4px 10px; border: 1px solid #dfe6e9; border-radius: 4px; background: #fff; cursor: pointer; font-size: 12px; }
-.save-btn { background: #00b894; color: #fff; border: none; margin-top: 4px; }
-.sp-card .sp-actions button:hover { background: #dfe6e9; }
-.sp-card .sp-code { display: none; margin-top: 8px; }
-.sp-card .sp-code.open { display: block; }
-.sp-card textarea.sp-code-editor { width: 100%; min-height: 150px; font-family: "Fira Code", monospace; font-size: 13px; border: 1px solid #dfe6e9; border-radius: 4px; padding: 8px; }
 
-#deploy-actions { margin-top: 16px; display: flex; gap: 8px; }
+/* ====== SP Code Section ====== */
+.sp-code-section { margin-bottom: 12px; }
+.sp-code-header {
+    display: flex; align-items: center; gap: 6px;
+    padding: 8px 12px; cursor: pointer; user-select: none;
+    background: #f1f3f8; font-size: 13px; color: #2d3436;
+    border: 1px solid #e8ecf1; border-radius: 6px 6px 0 0;
+}
+.sp-code-header:hover { background: #e8ecf1; }
+.sp-code-header .toggle-arrow { font-size: 11px; color: #636e72; width: 12px; }
+.sp-code-body { }
+.sp-code-body.collapsed { display: none; }
+.sp-code-body .CodeMirror {
+    height: 400px;
+    border: 1px solid #dfe6e9; border-top: none; border-radius: 0 0 4px 4px;
+    font-size: 13px;
+}
+.sp-code-body textarea.sp-code-editor { display: none; }
+.save-btn {
+    display: inline-block; margin-top: 6px;
+    padding: 6px 14px; border: none; border-radius: 4px;
+    background: #00b894; color: #fff; cursor: pointer;
+    font-size: 13px;
+}
+.save-btn:hover { background: #00a381; }
+
+/* ====== SP 操作按钮（校验 / 校验+保存） ====== */
+.sp-actions {
+    display: flex; align-items: center; gap: 8px; margin-top: 8px;
+}
+.verify-btn {
+    padding: 6px 14px; border: 1px solid #0984e3; border-radius: 4px;
+    background: #fff; color: #0984e3; cursor: pointer; font-size: 13px;
+}
+.verify-btn:hover { background: #e8f4fd; }
+.save-verify-btn {
+    padding: 6px 14px; border: none; border-radius: 4px;
+    background: #00b894; color: #fff; cursor: pointer; font-size: 13px;
+}
+.save-verify-btn:hover { background: #00a381; }
+.sp-action-status {
+    font-size: 12px; margin-left: 4px;
+}
+.sp-action-status.running { color: #f39c12; }
+.sp-action-status.success { color: #00b894; }
+.sp-action-status.fail { color: #d63031; }
+
+/* ====== 参数面板 ====== */
+.param-panel {
+    border: 1px solid #e8ecf1; border-radius: 6px;
+    overflow: hidden; margin-bottom: 12px;
+}
+.param-panel-header {
+    display: flex; align-items: center; gap: 6px;
+    padding: 8px 12px; cursor: pointer; user-select: none;
+    background: #fafbfd; font-size: 13px; color: #636e72;
+}
+.param-panel-header:hover { background: #f1f3f8; }
+.param-panel-header .toggle-arrow { font-size: 11px; color: #636e72; width: 12px; }
+.param-panel-body { padding: 8px 12px; }
+.param-panel-body.collapsed { display: none; }
+.param-row {
+    display: flex; align-items: center; gap: 10px; padding: 5px 0;
+}
+.param-row + .param-row { border-top: 1px solid #f5f6fa; }
+.param-label {
+    font-size: 13px; font-weight: 500; min-width: 100px; color: #2d3436;
+}
+.param-type {
+    font-size: 11px; color: #b2bec3; margin-left: 4px;
+    font-family: "Cascadia Code", "Fira Code", Consolas, monospace;
+}
+.param-input {
+    flex: 1; padding: 5px 10px; border: 1px solid #dfe6e9; border-radius: 4px;
+    font-size: 13px; font-family: "Cascadia Code", "Fira Code", Consolas, monospace;
+    background: #fff;
+}
+.param-input:focus { border-color: #6c5ce7; outline: none; }
+
+/* ====== SP 内联校验结果 ====== */
+.sp-verify-result {
+    margin-top: 8px; padding: 8px 12px;
+    background: #f5f6fa; border-radius: 6px;
+    border: 1px solid #e8ecf1;
+}
+.spr-summary { font-weight: 600; font-size: 13px; margin-bottom: 4px; }
+.spr-details { font-size: 12px; }
+.spr-row { padding: 3px 0; border-bottom: 1px solid #eee; }
+.spr-row:last-child { border-bottom: none; }
+.spr-row.pass { color: #00b894; }
+.spr-row.fail { color: #d63031; }
+
+/* ====== Verify Inline（校验 SQL 组） ====== */
+.verify-inline { border: 1px solid #e8ecf1; border-radius: 6px; overflow: hidden; }
+.verify-inline-header {
+    display: flex; align-items: center; gap: 6px;
+    padding: 8px 12px; cursor: pointer; user-select: none;
+    background: #f1f3f8; font-size: 13px; color: #2d3436;
+}
+.verify-inline-header:hover { background: #e8ecf1; }
+.verify-inline-header .toggle-arrow { font-size: 11px; color: #636e72; width: 12px; }
+.verify-inline-body { padding: 6px 12px; }
+.verify-inline-body.collapsed { display: none; }
+
+/* 单条校验 SQL 卡片 */
+.vq-inline-card { padding: 8px 0; border-bottom: 1px solid #f1f3f8; }
+.vq-inline-card:last-child { border-bottom: none; }
+.vq-inline-header {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 13px; cursor: pointer; user-select: none;
+    padding: 4px 0;
+}
+.vq-inline-header:hover { color: #0984e3; }
+.vq-inline-header .toggle-arrow { font-size: 11px; color: #636e72; width: 12px; }
+.vq-inline-header .verify-status { margin-left: auto; }
+.vq-meta { font-size: 11px; color: #636e72; margin-bottom: 6px; }
+
+/* 校验 SQL 卡片折叠体 */
+.vq-card-body { padding: 0 0 0 18px; }
+.vq-card-body.collapsed { display: none; }
+
+/* 校验 SQL CodeMirror 编辑器 */
+.vq-inline-card .CodeMirror {
+    height: 180px;
+    border: 1px solid #dfe6e9; border-radius: 4px;
+    font-size: 13px; margin-top: 4px;
+}
+
+.vq-result-detail { margin-top: 4px; font-size: 11px; background: #dfe6e9; padding: 8px; border-radius: 4px; overflow-x: auto; max-height: 120px; }
+
+/* 校验状态标签 */
+.verify-status { font-size: 11px; padding: 1px 6px; border-radius: 8px; }
+.verify-status.pass { background: #55efc4; color: #00b894; }
+.verify-status.fail { background: #fab1a0; color: #d63031; }
+.verify-status.pending { background: #dfe6e9; color: #636e72; }
+
+/* ====== Chat 内校验结果 ====== */
+.verify-chat-card { background: #f5f6fa; border-radius: 6px; padding: 8px 12px; margin: 8px 0; }
+.verify-chat-title { font-weight: 600; font-size: 14px; }
+.verify-chat-summary { font-size: 13px; margin: 4px 0; }
+.verify-chat-details { margin-top: 6px; }
+.vcd-row { font-size: 12px; padding: 3px 0; border-bottom: 1px solid #eee; }
+.vcd-row:last-child { border-bottom: none; }
+.vcd-row.pass { color: #00b894; }
+.vcd-row.fail { color: #d63031; }
+
+/* ====== Deploy Actions ====== */
+#deploy-actions { margin-top: auto; padding-top: 12px; display: flex; gap: 8px; }
 #deploy-actions button { flex: 1; padding: 10px; border: none; border-radius: 8px; font-size: 14px; cursor: pointer; }
 #btn-precheck { background: #fdcb6e; color: #2d3436; }
 #btn-deploy { background: #00b894; color: #fff; }
 #btn-deploy:disabled { background: #b2bec3; cursor: not-allowed; }
 #deploy-result { margin-top: 8px; font-size: 13px; }
 
+/* ====== 通用 ====== */
+.empty-hint { color: #636e72; font-size: 13px; padding: 8px 0; }
+
+
+/* ====== 配置页面 ====== */
 .config-page { max-width: 600px; margin: 40px auto; }
 .config-page h1 { margin-bottom: 24px; }
 .config-section { background: #fff; border-radius: 8px; padding: 20px; margin-bottom: 16px; }
