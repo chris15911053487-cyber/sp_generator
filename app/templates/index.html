@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SP Generator — SAP B1 存储过程智能体</title>
+    <script src="https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/6.65.7/codemirror.min.css">
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <header id="topbar">
+        <span id="logo">🗄️ SP Generator</span>
+        <nav>
+            <select id="session-select" onchange="switchSession()">
+                <option value="">加载中...</option>
+            </select>
+            <button onclick="createSession()">➕ 新建</button>
+            <button onclick="deleteCurrentSession()">🗑️ 删除</button>
+            <a href="/config" id="settings-link">⚙️ 设置</a>
+        </nav>
+        <div id="status-bar">
+            <span id="db-status">🔍 检测中...</span>
+            <span id="llm-status"></span>
+        </div>
+    </header>
+
+    <main>
+        <section id="chat-panel">
+            <div id="chat-messages"></div>
+            <form id="chat-form" onsubmit="sendMessage(event)">
+                <textarea id="chat-input" name="message" placeholder="描述你的存储过程需求..." rows="2"></textarea>
+                <button type="submit">发送</button>
+            </form>
+        </section>
+
+        <section id="right-panel">
+            <h2>存储过程列表</h2>
+            <div id="sp-list"></div>
+
+            <h2>校验 SQL 列表</h2>
+            <div id="verify-list"></div>
+
+            <div id="deploy-actions">
+                <button id="btn-precheck" onclick="precheckDeploy()">🔍 一键预检</button>
+                <button id="btn-deploy" onclick="deployAll()" disabled>🚀 一键部署</button>
+                <div id="deploy-result"></div>
+            </div>
+        </section>
+    </main>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/6.65.7/codemirror.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/6.65.7/mode/sql/sql.min.js"></script>
+    <script>
+    let currentSessionId = '';
+
+    async function loadSessions() {
+        const r = await fetch('/api/sessions');
+        const data = await r.json();
+        const sel = document.getElementById('session-select');
+        sel.innerHTML = '';
+        for (const s of data.sessions) {
+            const opt = document.createElement('option');
+            opt.value = s.id;
+            opt.textContent = s.name;
+            sel.appendChild(opt);
+        }
+        if (data.sessions.length > 0) {
+            currentSessionId = data.sessions[0].id;
+            sel.value = currentSessionId;
+            loadMessages();
+            loadSpList();
+        }
+    }
+
+    function switchSession() {
+        currentSessionId = document.getElementById('session-select').value;
+        document.getElementById('chat-messages').innerHTML = '';
+        loadMessages();
+        loadSpList();
+    }
+
+    async function createSession() {
+        const name = prompt('会话名称:', '新会话') || '新会话';
+        await fetch('/api/sessions', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({name}),
+        });
+        loadSessions();
+    }
+
+    async function deleteCurrentSession() {
+        if (!currentSessionId || !confirm('确定删除当前会话？')) return;
+        await fetch(`/api/sessions/${currentSessionId}`, {method: 'DELETE'});
+        currentSessionId = '';
+        document.getElementById('chat-messages').innerHTML = '';
+        document.getElementById('sp-list').innerHTML = '';
+        loadSessions();
+    }
+
+    async function loadMessages() {
+        if (!currentSessionId) return;
+        const r = await fetch(`/api/chat/messages/${currentSessionId}`);
+        const data = await r.json();
+        const container = document.getElementById('chat-messages');
+        container.innerHTML = '';
+        for (const m of data.messages) {
+            const div = document.createElement('div');
+            div.className = `message ${m.role}`;
+            div.textContent = m.content;
+            container.appendChild(div);
+        }
+        container.scrollTop = container.scrollHeight;
+    }
+
+    async function sendMessage(event) {
+        event.preventDefault();
+        const input = document.getElementById('chat-input');
+        const message = input.value.trim();
+        if (!message || !currentSessionId) return;
+
+        const container = document.getElementById('chat-messages');
+        const userDiv = document.createElement('div');
+        userDiv.className = 'message user';
+        userDiv.textContent = message;
+        container.appendChild(userDiv);
+        container.scrollTop = container.scrollHeight;
+        input.value = '';
+
+        const r = await fetch('/api/chat/stream', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({session_id: currentSessionId, message: message}),
+        });
+
+        const reader = r.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let assistantText = '';
+
+        while (true) {
+            const {done, value} = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, {stream: true});
+            const lines = buffer.split('\n');
+            buffer = lines.pop();
+            for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                    try {
+                        const data = JSON.parse(line.slice(6));
+                        if (data.type === 'done') {
+                            assistantText = data.content;
+                            const div = document.createElement('div');
+                            div.className = 'message assistant';
+                            div.textContent = data.content;
+                            container.appendChild(div);
+                            loadSpList();
+                        } else if (data.type === 'error') {
+                            const div = document.createElement('div');
+                            div.className = 'message error';
+                            div.textContent = data.content;
+                            container.appendChild(div);
+                        }
+                    } catch(e) {}
+                }
+            }
+            container.scrollTop = container.scrollHeight;
+        }
+    }
+
+    async function loadSpList() {
+        if (!currentSessionId) return;
+        const r = await fetch(`/api/sp/${currentSessionId}`);
+        const data = await r.json();
+        const container = document.getElementById('sp-list');
+        if (data.procedures.length === 0) {
+            container.innerHTML = '<p style="color:#636e72;font-size:13px;">暂无存储过程</p>';
+            return;
+        }
+        container.innerHTML = data.procedures.map(sp => `
+            <div class="sp-card">
+                <div class="sp-header">
+                    <span class="sp-name">${sp.name}</span>
+                    <span class="sp-status ${sp.status || 'draft'}">${sp.status || 'draft'}</span>
+                </div>
+                <div class="sp-actions">
+                    <button onclick="toggleSpCode('${sp.id}')">▸ 代码</button>
+                    <button onclick="editSp('${sp.id}')">✎ 编辑</button>
+                    <button onclick="verifySp('${sp.id}')">✓ 校验</button>
+                </div>
+                <div class="sp-code" id="sp-code-${sp.id}">
+                    <textarea id="sp-editor-${sp.id}" class="sp-code-editor" readonly>${escapeHtml(sp.code)}</textarea>
+                </div>
+            </div>
+        `).join('');
+    }
+
+    function escapeHtml(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+    function toggleSpCode(spId) {
+        const el = document.getElementById(`sp-code-${spId}`);
+        el.classList.toggle('open');
+        if (el.classList.contains('open')) {
+            setTimeout(() => initCodeMirror(`sp-editor-${spId}`), 100);
+        }
+    }
+
+    function editSp(spId) {
+        const ta = document.getElementById(`sp-editor-${spId}`);
+        ta.readOnly = !ta.readOnly;
+        if (!ta.readOnly) {
+            ta.style.background = '#fffbe6';
+            const saveBtn = document.createElement('button');
+            saveBtn.textContent = '保存';
+            saveBtn.className = 'save-btn';
+            saveBtn.onclick = async () => {
+                const name = prompt('存储过程名称:', '');
+                if (name) {
+                    await fetch(`/api/sp/${spId}`, {
+                        method: 'PUT',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({name, code: ta.value}),
+                    });
+                    ta.readOnly = true;
+                    ta.style.background = '';
+                    saveBtn.remove();
+                    loadSpList();
+                }
+            };
+            ta.parentElement.appendChild(saveBtn);
+        }
+    }
+
+    async function verifySp(spId) {
+        const r = await fetch(`/api/verify/business/${spId}`, {method: 'POST'});
+        const data = await r.json();
+        alert('校验结果:\n' + JSON.stringify(data.results, null, 2));
+    }
+
+    async function precheckDeploy() {
+        if (!currentSessionId) return;
+        const r = await fetch(`/api/deploy/precheck/${currentSessionId}`, {method: 'POST'});
+        const data = await r.json();
+        const rd = document.getElementById('deploy-result');
+        if (data.ok) {
+            rd.innerHTML = '✅ 预检通过，可以部署';
+            document.getElementById('btn-deploy').disabled = false;
+        } else {
+            rd.innerHTML = data.results.map(r => r.syntax_ok ? `✅ ${r.name}` : `❌ ${r.name}: ${r.error}`).join('<br>');
+            document.getElementById('btn-deploy').disabled = true;
+        }
+    }
+
+    async function deployAll() {
+        if (!currentSessionId) return;
+        const r = await fetch(`/api/deploy/${currentSessionId}`, {method: 'POST'});
+        const data = await r.json();
+        const rd = document.getElementById('deploy-result');
+        if (data.ok) {
+            rd.innerHTML = '🚀 全部部署成功！';
+        } else {
+            rd.innerHTML = data.results.map(r => r.success ? `✅ ${r.name}` : `❌ ${r.name}: ${r.error}`).join('<br>');
+        }
+    }
+
+    function initCodeMirror(textareaId) {
+        const ta = document.getElementById(textareaId);
+        if (!ta || ta.nextSibling?.classList?.contains('CodeMirror')) return;
+        CodeMirror.fromTextArea(ta, {
+            mode: 'text/x-sql',
+            lineNumbers: true,
+            readOnly: ta.readOnly,
+            theme: 'default',
+        });
+    }
+
+    async function checkDbStatus() {
+        try {
+            const r = await fetch('/api/config/test-db');
+            const d = await r.json();
+            document.getElementById('db-status').textContent = d.ok ? '🟢 数据库已连接' : '🔴 ' + d.message;
+        } catch(e) {
+            document.getElementById('db-status').textContent = '🔴 服务器未启动';
+        }
+    }
+
+    loadSessions();
+    checkDbStatus();
+    </script>
+</body>
+</html>

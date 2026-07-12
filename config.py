@@ -5,11 +5,11 @@ import os
 DB_PATH = os.path.join(os.path.dirname(__file__), "data", "app.db")
 
 DEFAULT_CONFIG = {
-    "db_server": "139.199.221.230",
-    "db_port": "1400",
-    "db_user": "sa",
-    "db_password": "<YourStrong@Passw0rd>",
-    "db_database": "B1UP_DEMO",
+    "db_server": "localhost",
+    "db_port": "1433",
+    "db_user": "",
+    "db_password": "",
+    "db_database": "",
     "llm_api_key": "",
     "llm_base_url": "https://api.deepseek.com/v1",
     "llm_model_name": "deepseek-v4-pro",

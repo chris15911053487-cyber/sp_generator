@@ -1,0 +1,57 @@
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f5f6fa; color: #2d3436; height: 100vh; display: flex; flex-direction: column; }
+
+#topbar { display: flex; align-items: center; gap: 12px; padding: 8px 16px; background: #2d3436; color: #fff; }
+#logo { font-weight: 700; font-size: 16px; }
+#topbar nav { display: flex; gap: 8px; align-items: center; }
+#topbar select { padding: 4px 8px; border-radius: 4px; border: none; }
+#topbar button, #settings-link { padding: 4px 12px; border: none; border-radius: 4px; background: #6c5ce7; color: #fff; cursor: pointer; font-size: 13px; text-decoration: none; }
+#settings-link { background: #636e72; }
+#status-bar { margin-left: auto; display: flex; gap: 16px; font-size: 12px; }
+
+main { display: flex; flex: 1; overflow: hidden; }
+
+#chat-panel { flex: 6; display: flex; flex-direction: column; border-right: 1px solid #dfe6e9; }
+#chat-messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+#chat-messages .message { max-width: 80%; padding: 10px 14px; border-radius: 12px; line-height: 1.5; font-size: 14px; white-space: pre-wrap; word-break: break-word; }
+#chat-messages .user { align-self: flex-end; background: #6c5ce7; color: #fff; }
+#chat-messages .assistant { align-self: flex-start; background: #fff; border: 1px solid #dfe6e9; }
+#chat-messages .system { align-self: center; font-size: 12px; color: #636e72; }
+#chat-messages .error { align-self: flex-start; background: #ff7675; color: #fff; }
+#chat-form { display: flex; padding: 12px; gap: 8px; border-top: 1px solid #dfe6e9; background: #fff; }
+#chat-form textarea { flex: 1; padding: 8px; border: 1px solid #dfe6e9; border-radius: 8px; resize: none; font-size: 14px; }
+#chat-form button { padding: 8px 16px; background: #6c5ce7; color: #fff; border: none; border-radius: 8px; cursor: pointer; }
+
+#right-panel { flex: 4; padding: 16px; overflow-y: auto; }
+#right-panel h2 { font-size: 14px; color: #636e72; margin: 12px 0 8px; padding-bottom: 4px; border-bottom: 1px solid #dfe6e9; }
+#right-panel h2:first-child { margin-top: 0; }
+
+.sp-card { background: #fff; border: 1px solid #dfe6e9; border-radius: 8px; padding: 12px; margin-bottom: 8px; }
+.sp-card .sp-header { display: flex; justify-content: space-between; align-items: center; }
+.sp-card .sp-name { font-weight: 600; font-size: 14px; }
+.sp-card .sp-status { font-size: 12px; padding: 2px 8px; border-radius: 12px; }
+.sp-status.draft { background: #ffeaa7; color: #d63031; }
+.sp-status.verified { background: #55efc4; color: #00b894; }
+.sp-status.deployed { background: #74b9ff; color: #0984e3; }
+.sp-card .sp-actions { display: flex; gap: 8px; margin-top: 8px; }
+.sp-card .sp-actions button, .save-btn { padding: 4px 10px; border: 1px solid #dfe6e9; border-radius: 4px; background: #fff; cursor: pointer; font-size: 12px; }
+.save-btn { background: #00b894; color: #fff; border: none; margin-top: 4px; }
+.sp-card .sp-actions button:hover { background: #dfe6e9; }
+.sp-card .sp-code { display: none; margin-top: 8px; }
+.sp-card .sp-code.open { display: block; }
+.sp-card textarea.sp-code-editor { width: 100%; min-height: 150px; font-family: "Fira Code", monospace; font-size: 13px; border: 1px solid #dfe6e9; border-radius: 4px; padding: 8px; }
+
+#deploy-actions { margin-top: 16px; display: flex; gap: 8px; }
+#deploy-actions button { flex: 1; padding: 10px; border: none; border-radius: 8px; font-size: 14px; cursor: pointer; }
+#btn-precheck { background: #fdcb6e; color: #2d3436; }
+#btn-deploy { background: #00b894; color: #fff; }
+#btn-deploy:disabled { background: #b2bec3; cursor: not-allowed; }
+#deploy-result { margin-top: 8px; font-size: 13px; }
+
+.config-page { max-width: 600px; margin: 40px auto; }
+.config-page h1 { margin-bottom: 24px; }
+.config-section { background: #fff; border-radius: 8px; padding: 20px; margin-bottom: 16px; }
+.config-section h2 { font-size: 16px; margin-bottom: 12px; }
+.config-section label { display: block; margin-bottom: 8px; font-size: 13px; color: #636e72; }
+.config-section input { width: 100%; padding: 8px; border: 1px solid #dfe6e9; border-radius: 4px; margin-bottom: 12px; }
+.config-section button { padding: 8px 16px; background: #6c5ce7; color: #fff; border: none; border-radius: 4px; cursor: pointer; }

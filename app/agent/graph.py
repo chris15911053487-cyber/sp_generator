@@ -1,0 +1,39 @@
+"""LangGraph StateGraph 组装 — 定义节点和条件边的完整流程。"""
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
+from app.agent.nodes import (
+    AgentState, clarify_node, design_node, generate_node,
+    verify_node, deploy_check_node, deploy_node,
+)
+
+
+def _after_clarify(state: AgentState) -> str:
+    if state.get("mode") == "design":
+        return "plan"
+    return "clarify"
+
+
+def create_graph() -> StateGraph:
+    builder = StateGraph(AgentState)
+
+    builder.add_node("clarify", clarify_node)
+    builder.add_node("plan", design_node)
+    builder.add_node("generate", generate_node)
+    builder.add_node("verify", verify_node)
+    builder.add_node("deploy_check", deploy_check_node)
+    builder.add_node("deploy", deploy_node)
+
+    builder.set_entry_point("clarify")
+
+    builder.add_conditional_edges("clarify", _after_clarify, {
+        "clarify": "clarify",
+        "plan": "plan",
+    })
+    builder.add_edge("plan", "generate")
+    builder.add_edge("generate", "verify")
+    builder.add_edge("verify", END)
+    builder.add_edge("deploy_check", "deploy")
+    builder.add_edge("deploy", END)
+
+    memory = MemorySaver()
+    return builder.compile(checkpointer=memory)
