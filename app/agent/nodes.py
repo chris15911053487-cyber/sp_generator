@@ -136,7 +136,7 @@ def _parse_json(content: str) -> dict | None:
 def _parse_sp_params(code: str) -> list[dict]:
     """从 SP 代码中解析 @参数 声明，返回 [{name, type}, ...]"""
     params = []
-    pattern = r'@(\w+)\s+(\w+(?:\(\d+(?:,\d+)?\))?)'
+    pattern = r'@(\w+)\s+(\w+(?:\((?:MAX|\d+(?:,\d+)?)\))?)'
     for m in re.finditer(pattern, code, re.IGNORECASE):
         name = m.group(1)
         if name.upper() in ('NOCOUNT', 'RETURNS', 'MESSAGE', 'ERROR'):
@@ -232,6 +232,13 @@ def generate_node(state: AgentState, config: dict = None) -> dict:
 
     # === 阶段 2：为每个 SP 单独生成校验 SQL ===
     for sp_row in sp_list:
+        # 1. 先从 SP 代码解析 @参数 声明（始终执行，不依赖 LLM）
+        sp_params = _parse_sp_params(sp_row.get("code", ""))
+        verify_queries: list = []
+        sql_placeholders: set[str] = set()
+        llm_params: list = []
+
+        # 2. 生成校验 SQL
         vq_prompt = VERIFY_SQL_PROMPT.format(
             sp_name=sp_row["name"],
             sp_code=sp_row["code"],
@@ -241,9 +248,9 @@ def generate_node(state: AgentState, config: dict = None) -> dict:
         vq_data = _parse_json(vq_response.content)
 
         if vq_data:
-            verify_queries = vq_data.get("verify_queries", [])
-            if not isinstance(verify_queries, list):
-                verify_queries = []
+            raw_queries = vq_data.get("verify_queries", [])
+            if isinstance(raw_queries, list):
+                verify_queries = raw_queries
             for vq in verify_queries:
                 if not isinstance(vq, dict):
                     continue
@@ -253,24 +260,20 @@ def generate_node(state: AgentState, config: dict = None) -> dict:
                     vq.get("sql_code", ""),
                     vq.get("compare_columns", ""),
                 )
+                sql_placeholders |= _parse_sql_placeholders(vq.get("sql_code", ""))
+            llm_params = vq_data.get("parameters", [])
 
-            # 合并参数并集（SP @参数 + 校验SQL {参数} + LLM defaults）
-            sp_params = _parse_sp_params(sp_row.get("code", ""))
-            sql_placeholders: set[str] = set()
-            for vq in verify_queries:
-                if isinstance(vq, dict):
-                    sql_placeholders |= _parse_sql_placeholders(vq.get("sql_code", ""))
-            llm_params = vq_data.get("parameters", []) if vq_data else []
-            print(f"[DEBUG params] SP={sp_row['name']}", flush=True)
-            print(f"[DEBUG params]   sp_params from code: {sp_params}", flush=True)
-            print(f"[DEBUG params]   sql_placeholders: {sql_placeholders}", flush=True)
-            print(f"[DEBUG params]   llm_params: {llm_params}", flush=True)
-            merged = _merge_parameters(sp_params, sql_placeholders, llm_params)
-            print(f"[DEBUG params]   merged={merged}", flush=True)
-            if merged:
-                from app.db.sqlite import update_sp as db_update_sp2
-                db_update_sp2(sp_row["id"], parameters=json.dumps(merged, ensure_ascii=False))
-                sp_row["parameters"] = json.dumps(merged, ensure_ascii=False)
+        # 3. 合并参数并集（SP @参数 + 校验SQL {参数} + LLM defaults）
+        print(f"[DEBUG params] SP={sp_row['name']}", flush=True)
+        print(f"[DEBUG params]   sp_params from code: {sp_params}", flush=True)
+        print(f"[DEBUG params]   sql_placeholders: {sql_placeholders}", flush=True)
+        print(f"[DEBUG params]   llm_params: {llm_params}", flush=True)
+        merged = _merge_parameters(sp_params, sql_placeholders, llm_params)
+        print(f"[DEBUG params]   merged={merged}", flush=True)
+        if merged:
+            from app.db.sqlite import update_sp as db_update_sp2
+            db_update_sp2(sp_row["id"], parameters=json.dumps(merged, ensure_ascii=False))
+            sp_row["parameters"] = json.dumps(merged, ensure_ascii=False)
 
     return {
         "sp_list": sp_list,
@@ -325,7 +328,7 @@ def verify_node(state: AgentState, config: dict = None) -> dict:
             try:
                 sql_to_run = _substitute_params_sql(vq["sql_code"], params)
                 verify_rows = execute_query(sql_to_run)
-                update_verify_query(vq["id"], status="pass", result_detail=str(verify_rows[:20]))
+                update_verify_query(vq["id"], status="pass", result_detail=json.dumps(verify_rows[:20], ensure_ascii=False, indent=2))
                 sp_result["details"].append(
                     {"type": "business", "pass": True, "query": vq["name"], "data": verify_rows[:10]}
                 )

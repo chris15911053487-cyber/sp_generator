@@ -200,7 +200,8 @@ main { display: flex; flex: 1; overflow: hidden; }
     font-size: 13px; margin-top: 4px;
 }
 
-.vq-result-detail { margin-top: 4px; font-size: 11px; background: #dfe6e9; padding: 8px; border-radius: 4px; overflow-x: auto; max-height: 120px; }
+.vq-result-detail { margin-top: 4px; font-size: 11px; background: #dfe6e9; padding: 8px; border-radius: 4px; overflow-x: auto; max-height: 120px; white-space: pre-wrap; word-break: break-word; }
+.vq-code-editor { display: none; }
 
 /* 校验状态标签 */
 .verify-status { font-size: 11px; padding: 1px 6px; border-radius: 8px; }

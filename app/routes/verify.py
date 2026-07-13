@@ -69,7 +69,7 @@ def api_check_business(sp_id: str, req: VerifySpRequest = None):
         try:
             sql_to_run = _substitute_params(vq["sql_code"], params)
             rows = execute_query(sql_to_run)
-            update_verify_query(vq["id"], status="pass", result_detail=str(rows[:20]))
+            update_verify_query(vq["id"], status="pass", result_detail=json.dumps(rows[:20], ensure_ascii=False, indent=2))
             results.append({"query_id": vq["id"], "name": vq["name"], "pass": True, "data": rows[:10]})
         except Exception as e:
             update_verify_query(vq["id"], status="fail", result_detail=str(e))
@@ -145,7 +145,7 @@ def api_verify_single_sp(sp_id: str, req: VerifySpRequest = None):
         try:
             sql_to_run = _substitute_params(vq["sql_code"], params)
             rows = execute_query(sql_to_run)
-            update_verify_query(vq["id"], status="pass", result_detail=str(rows[:20]))
+            update_verify_query(vq["id"], status="pass", result_detail=json.dumps(rows[:20], ensure_ascii=False, indent=2))
             biz_results.append({"query_id": vq["id"], "name": vq["name"], "pass": True, "data": rows[:10]})
         except Exception as e:
             biz_all_ok = False
@@ -203,7 +203,7 @@ def api_verify_all(session_id: str):
             try:
                 sql_to_run = _substitute_params(vq["sql_code"], params)
                 rows = execute_query(sql_to_run)
-                update_verify_query(vq["id"], status="pass", result_detail=str(rows[:20]))
+                update_verify_query(vq["id"], status="pass", result_detail=json.dumps(rows[:20], ensure_ascii=False, indent=2))
                 biz_results.append({"query_id": vq["id"], "name": vq["name"], "pass": True})
             except Exception as e:
                 update_verify_query(vq["id"], status="fail", result_detail=str(e))

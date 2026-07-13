@@ -132,7 +132,7 @@ VERIFY_SQL_PROMPT = """为以下存储过程生成业务校验 SQL。
   "verify_queries": [
     {{
       "name": "校验_XXX",
-      "sql_code": "SELECT SUM(...) FROM OINV WHERE DocDate BETWEEN {{FromDate}} AND {{ToDate}}",
+      "sql_code": "SELECT\\n    SUM(DocTotal) AS TotalAmount\\nFROM OINV\\nWHERE DocDate BETWEEN {{FromDate}} AND {{ToDate}}",
       "compare_columns": "列名1,列名2"
     }}
   ],
@@ -181,7 +181,16 @@ VERIFY_SQL_PROMPT = """为以下存储过程生成业务校验 SQL。
 ### 5. 参数默认值要合理
 - 日期类型：使用具体日期如 "2024-01-01"，或相对日期如最近 30 天的范围
 - 字符串类型：使用有代表性的示例值（如客户代码 "C001"）
-- 数值类型：使用合理的数值"""
+- 数值类型：使用合理的数值
+
+### 6. SQL 格式化（重要！）
+- sql_code 必须像手写 SQL 一样格式化，每个子句独占一行
+- SELECT / FROM / WHERE / GROUP BY / ORDER BY / HAVING 等关键字都换行
+- 字段列表用缩进对齐
+- 正确示例：
+  SELECT\\n    Col1,\\n    SUM(Col2) AS Total\\nFROM TableName\\nWHERE Condition1\\n    AND Condition2\\nGROUP BY Col1\\nORDER BY Col1
+- 错误示例：
+  SELECT Col1, SUM(Col2) FROM TableName WHERE Condition1 AND Condition2 (禁止单行)"""
 
 VERIFY_PROMPT = """分析以下校验结果。
 存储过程输出：
