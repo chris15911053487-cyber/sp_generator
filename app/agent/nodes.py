@@ -306,7 +306,7 @@ def _merge_parameters(sp_params: list[dict], sql_placeholders: set[str],
 
 def generate_node(state: AgentState, config: dict = None) -> dict:
     """代码生成节点 — 两阶段：先生成 SP，再为每个 SP 单独生成校验 SQL。"""
-    from app.db.sqlite import delete_sps_by_session
+    from app.db.sqlite import delete_sps_except
 
     llm = _get_llm()
     session_id = state["session_id"]
@@ -327,9 +327,8 @@ def generate_node(state: AgentState, config: dict = None) -> dict:
             "raw_response": response.content,
         }
 
-    # parsed OK：删除该会话下的旧 SP（级联删除校验 SQL），再保存新的
-    delete_sps_by_session(session_id)
-
+    # parsed OK：先保存新 SP，再删除旧 SP（级联删除校验 SQL）。
+    # 这样代码重新生成期间右侧列表始终有旧 SP，新 SP 全部就绪后才替换。
     sp_list = []
     for proc in data.get("procedures", []):
         # 清理代码：移除 GO 语句（SSMS 批处理分隔符，不是有效 T-SQL）
@@ -339,6 +338,8 @@ def generate_node(state: AgentState, config: dict = None) -> dict:
         sp = save_sp(session_id, proc["name"], code)
         sp_row = dict(sp) if not isinstance(sp, dict) else sp
         sp_list.append(sp_row)
+    # 新 SP 已写入，删除旧 SP（除刚保存的）
+    delete_sps_except(session_id, [s["id"] for s in sp_list])
 
     # === 阶段 2：为每个 SP 单独生成校验 SQL ===
     for sp_row in sp_list:

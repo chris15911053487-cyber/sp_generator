@@ -196,6 +196,29 @@ def delete_sps_by_session(session_id: str) -> int:
     return count
 
 
+def delete_sps_except(session_id: str, keep_ids: list) -> int:
+    """删除指定会话下除 keep_ids 外的所有 SP（级联删除校验 SQL）。
+
+    用于"先保存新 SP 再删除旧 SP"：新 SP 已写入后再清旧 SP，
+    避免代码重新生成期间右侧列表变空。
+    """
+    conn = _get_conn()
+    if keep_ids:
+        placeholders = ",".join("?" * len(keep_ids))
+        cursor = conn.execute(
+            f"DELETE FROM stored_procedures WHERE session_id = ? AND id NOT IN ({placeholders})",
+            [session_id] + list(keep_ids),
+        )
+    else:
+        cursor = conn.execute(
+            "DELETE FROM stored_procedures WHERE session_id = ?", (session_id,)
+        )
+    count = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return count
+
+
 # --- Verify Queries ---
 
 def save_verify_query(sp_id: str, name: str, sql_code: str,
