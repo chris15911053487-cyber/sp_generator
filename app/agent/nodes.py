@@ -338,10 +338,9 @@ def generate_node(state: AgentState, config: dict = None) -> dict:
         sp = save_sp(session_id, proc["name"], code)
         sp_row = dict(sp) if not isinstance(sp, dict) else sp
         sp_list.append(sp_row)
-    # 新 SP 已写入，删除旧 SP（除刚保存的）
-    delete_sps_except(session_id, [s["id"] for s in sp_list])
-
     # === 阶段 2：为每个 SP 单独生成校验 SQL ===
+    # 注意：旧 SP 暂不删除，等阶段 2 全部完成后统一替换，
+    # 避免校验 SQL 生成中途出错导致旧 SP 已丢、新 SP 不完整
     for sp_row in sp_list:
         # 1. 先从 SP 代码解析 @参数 声明（始终执行，不依赖 LLM）
         sp_params = _parse_sp_params(sp_row.get("code", ""))
@@ -386,6 +385,9 @@ def generate_node(state: AgentState, config: dict = None) -> dict:
             from app.db.sqlite import update_sp as db_update_sp2
             db_update_sp2(sp_row["id"], parameters=json.dumps(merged, ensure_ascii=False))
             sp_row["parameters"] = json.dumps(merged, ensure_ascii=False)
+
+    # 新 SP 全部就绪（代码 + 参数 + 校验 SQL），现在替换旧 SP
+    delete_sps_except(session_id, [s["id"] for s in sp_list])
 
     return {
         "sp_list": sp_list,

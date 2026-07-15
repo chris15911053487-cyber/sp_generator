@@ -243,7 +243,11 @@
                             showSpVerifyResult(vr.sp_id, vr);
                         }
                     } else if (data.type === 'update') {
-                        loadSpList();
+                        // 仅 generate/verify 节点会改变 SP 数据，避免 clarify/plan
+                        // 阶段不必要的 DOM 重建导致 CodeMirror 被销毁
+                        if (data.node === 'generate' || data.node === 'verify') {
+                            loadSpList();
+                        }
                     } else if (data.type === 'done') {
                         if (!assistantText) {
                             assistantText = data.content;
@@ -301,6 +305,9 @@
 
     async function loadSpList() {
         if (!currentSessionId) return;
+        // 清除 CodeMirror 实例缓存：innerHTML 替换会销毁 DOM，
+        // 不清缓存会导致后续 initCodeMirror 被旧引用阻塞，代码区空白
+        cmInstances = {};
         const container = document.getElementById('sp-list');
 
         const spR = await fetch(`/api/sp/${currentSessionId}`);
