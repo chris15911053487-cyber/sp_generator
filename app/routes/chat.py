@@ -71,6 +71,7 @@ async def api_chat_stream(req: ChatRequest):
                         "verify_results": [],
                         "status": "",
                         "error": "",
+                        "clarify_count": state.values.get("clarify_count", 0) if state.values else 0,
                     }
                     events = graph.stream(new_input, config)
                 else:
@@ -91,6 +92,7 @@ async def api_chat_stream(req: ChatRequest):
                     "verify_results": state.values.get("verify_results", []),
                     "status": state.values.get("status", ""),
                     "error": state.values.get("error", ""),
+                    "clarify_count": state.values.get("clarify_count", 0),
                 }
                 events = graph.stream(input_state, config)
             else:
@@ -105,6 +107,7 @@ async def api_chat_stream(req: ChatRequest):
                     "verify_results": [],
                     "status": "",
                     "error": "",
+                    "clarify_count": 0,
                 }
                 events = graph.stream(input_state, config)
 
@@ -160,7 +163,9 @@ async def api_chat_stream(req: ChatRequest):
                 if isinstance(interrupt_val, dict):
                     itype = interrupt_val.get("type", "")
                     if itype == "clarify":
-                        assistant_response = interrupt_val.get("question", "")
+                        q_num = interrupt_val.get("q_num", "")
+                        prefix = f"Q{q_num}：" if q_num else ""
+                        assistant_response = prefix + interrupt_val.get("question", "")
                         yield f"data: {json.dumps({'type': 'question', 'content': assistant_response})}\n\n"
                     elif itype == "design":
                         assistant_response = interrupt_val.get("content", "")
