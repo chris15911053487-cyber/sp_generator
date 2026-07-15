@@ -141,25 +141,45 @@ def _extract_first_question(content: str) -> str:
 
 
 def clarify_node(state: AgentState, config: dict = None) -> dict:
-    """需求澄清节点 — 最多 3 轮提问，超限自动进入设计阶段。"""
+    """需求澄清节点 — 系统控制编号，最多 5 个问题，可提前结束。"""
     llm = _get_llm()
     chat_history = _build_chat_history(state["session_id"])
     clarified = state.get("requirements", "")
+    clarify_count = state.get("clarify_count", 0) or 0
 
-    # 安全限制：超过 5 轮提问后强制进入设计（正常情况下 LLM 会自行 INFO_SUFFICIENT）
-    msgs = get_messages(state["session_id"])
-    user_count = sum(1 for m in msgs if m["role"] == "user")
-    if user_count >= 6:  # 第 1 条是原始需求，之后每条回答算 1 轮
+    # 上限 5：已问满 5 个，强制进设计
+    if clarify_count >= 5:
         return {
             "requirements": clarified,
             "mode": "design",
             "status": "clarified",
+            "clarify_count": clarify_count,
         }
+
+    # 外部安全网：用户消息过多仍强制进设计（防止 clarify_count 状态丢失）
+    msgs = get_messages(state["session_id"])
+    user_count = sum(1 for m in msgs if m["role"] == "user")
+    if user_count >= 6:
+        return {
+            "requirements": clarified,
+            "mode": "design",
+            "status": "clarified",
+            "clarify_count": clarify_count,
+        }
+
+    q_num = clarify_count + 1
+    last_question_hint = (
+        "这是最后一个问题：用户回答时若还有其他需求想补充，可直接一并说明；"
+        "否则只回复选项即可，无需回复\"无\"。"
+        if clarify_count == 4 else ""
+    )
 
     prompt = CLARIFY_PROMPT.format(
         user_input=state["user_input"],
         chat_history=chat_history,
         clarified_info=clarified or "暂无",
+        q_num=q_num,
+        last_question_hint=last_question_hint,
     )
     messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=prompt)]
     response = _invoke_with_tools(llm, messages)
@@ -169,21 +189,24 @@ def clarify_node(state: AgentState, config: dict = None) -> dict:
             "requirements": response.content.replace("INFO_SUFFICIENT", "").strip(),
             "mode": "design",
             "status": "clarified",
+            "clarify_count": clarify_count,
         }
 
-    question = response.content
-    answer = interrupt({"type": "clarify", "question": question})
+    # 截断 LLM 违规输出的多个问题，只取第一个；系统负责编号
+    question = _extract_first_question(response.content)
+    answer = interrupt({"type": "clarify", "question": question, "q_num": q_num})
 
     new_requirements = (
-        clarified + f"\nQ: {question}\nA: {answer}\n"
+        clarified + f"\nQ{q_num}: {question}\nA: {answer}\n"
         if clarified
-        else f"Q: {question}\nA: {answer}\n"
+        else f"Q{q_num}: {question}\nA: {answer}\n"
     )
     return {
         "user_input": state["user_input"],
         "requirements": new_requirements,
         "mode": "clarify",
         "status": "clarifying",
+        "clarify_count": clarify_count + 1,
     }
 
 
