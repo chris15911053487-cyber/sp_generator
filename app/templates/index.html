@@ -232,7 +232,8 @@
                         assistantDiv.innerHTML = '<strong>📋 设计方案：</strong><br><pre style="white-space:pre-wrap;font-size:13px;margin-top:4px;">' + escapeHtml(data.content) + '</pre>';
                     } else if (data.type === 'verify_result') {
                         assistantText = data.content;
-                        // 渲染校验结果到聊天区
+                        // 渲染校验结果到聊天区（改回 assistant 样式，避免被前一个 error 事件设为 message error 后白字）
+                        assistantDiv.className = 'message assistant';
                         assistantDiv.innerHTML = renderVerifyResult(data.content, data.data);
                         // 同步更新右侧 SP 卡片：状态标签 + 内联校验结果
                         const vResults = (data.data && data.data.verify_results) ? data.data.verify_results : [];

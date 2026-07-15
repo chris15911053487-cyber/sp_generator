@@ -112,7 +112,10 @@ def _invoke_with_tools(llm: ChatOpenAI, messages: list, max_rounds: int = 8) -> 
         # 3) 无工具调用：最终响应
         return response
 
-    # 循环耗尽：用不带工具的 LLM 强制生成最终响应
+    # 循环耗尽：LLM 仍想调工具时，强提示直接输出 JSON，避免 plain invoke 仍返回 DSML/空
+    messages.append(HumanMessage(
+        content="工具调用已达上限。请基于已获取的信息，直接输出最终的 JSON 响应，不要再调用任何工具。"
+    ))
     return llm.invoke(messages)
 
 

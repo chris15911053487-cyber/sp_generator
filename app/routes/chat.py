@@ -112,13 +112,18 @@ async def api_chat_stream(req: ChatRequest):
                 events = graph.stream(input_state, config)
 
             assistant_response = ""
+            generate_failed = False  # generate 失败时不再用 verify 结果覆盖，避免"校验全对但右侧旧SP"误导
 
             for event in events:
                 for node_name, node_output in event.items():
                     if isinstance(node_output, dict):
                         if node_output.get("error"):
-                            # 节点出错（如 LLM 响应解析失败）
-                            assistant_response = f"❌ 错误: {node_output['error']}"
+                            # generate 等节点出错（如 LLM 响应解析失败）
+                            generate_failed = True
+                            assistant_response = (
+                                f"❌ 生成失败：{node_output['error'][:300]}\n\n"
+                                "存储过程未能生成，右侧仍显示上一次的结果。请重新确认设计方案后重试。"
+                            )
                             yield f"data: {json.dumps({'type': 'error', 'content': assistant_response})}\n\n"
 
                         if node_output.get("status") == "generated":
@@ -129,6 +134,10 @@ async def api_chat_stream(req: ChatRequest):
                             assistant_response += "\n正在校验..."
 
                         elif node_output.get("status") in ("verified", "verify_failed"):
+                            # generate 已失败时跳过 verify 结果，避免用旧 SP 的校验结果误导用户
+                            if generate_failed:
+                                yield f"data: {json.dumps({'node': node_name, 'data': node_output, 'type': 'update'})}\n\n"
+                                continue
                             v_results = node_output.get("verify_results", [])
                             print(f"[DEBUG verify_result] status={node_output.get('status')}, v_results count={len(v_results)}", flush=True)
                             for i, vr in enumerate(v_results):
