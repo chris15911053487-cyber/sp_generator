@@ -125,6 +125,21 @@ def _build_chat_history(session_id: str, max_msgs: int = 10) -> str:
     return "\n".join(lines)
 
 
+def _extract_first_question(content: str) -> str:
+    """LLM 违规一次输出多个问题时，只截取第一个问题。
+
+    识别"第二个问题"的标记：行首的 `### 问题`、`问题N`、`Q N` 等。
+    只有一个问题或无标记时原样返回。
+    """
+    if not content:
+        return content
+    # 匹配行首的问题标记（第二个及以后）
+    marks = list(re.finditer(r'(?:^|\n)\s*(?:#{1,4}\s*)?(?:问题|Q)\s*\d+\s*[：:]', content))
+    if len(marks) >= 2:
+        return content[:marks[1].start()].rstrip()
+    return content
+
+
 def clarify_node(state: AgentState, config: dict = None) -> dict:
     """需求澄清节点 — 最多 3 轮提问，超限自动进入设计阶段。"""
     llm = _get_llm()
