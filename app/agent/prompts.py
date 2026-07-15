@@ -83,10 +83,15 @@ DESIGN_PROMPT = """基于已澄清的需求，现在设计存储过程方案。
 
 请用中文输出，格式清晰。"""
 
-GENERATE_PROMPT = """基于确认的方案，生成存储过程代码和校验 SQL。
+GENERATE_PROMPT = """基于确认的方案，生成存储过程代码。
 
 方案内容：
 {design}
+
+## 输出要求（必须严格遵守）
+- **必须为方案中列出的每一个存储过程都生成代码**：procedures 数组的长度必须与方案中列出的 SP 数量完全一致，不得遗漏、合并或自行增减。
+- 每个 SP 使用方案中指定的名称，不得擅自改名。
+- 校验 SQL 不在此阶段生成（由后续阶段单独生成），不要输出 verify_queries 字段。
 
 请输出 JSON 格式：
 ```json
@@ -94,14 +99,7 @@ GENERATE_PROMPT = """基于确认的方案，生成存储过程代码和校验 S
   "procedures": [
     {{
       "name": "SP_XXX",
-      "code": "CREATE PROCEDURE ...",
-      "verify_queries": [
-        {{
-          "name": "校验_XXX",
-          "sql_code": "SELECT ... FROM OINV ...",
-          "compare_columns": "列名1,列名2"
-        }}
-      ]
+      "code": "CREATE PROCEDURE ..."
     }}
   ]
 }}
@@ -112,9 +110,7 @@ GENERATE_PROMPT = """基于确认的方案，生成存储过程代码和校验 S
 - **代码中不要包含 GO 语句**（GO 不是 T-SQL 关键字，会导致语法错误）
 - **只用 B1 知识库列出的列名**，禁止猜测列名（如 Cancelled、TransId 在 RCT1 中、Status 在 OINV 中都不存在）
 - OINV 作废标志用 CANCELED='Y'，发票状态用 DocStatus IN ('O','C')
-- RCT1 关联发票用 InvEntry，关联收款单用 DocEntry
-- 校验 SQL 直接查询源表（如 OINV、INV1、OJDT），不通过视图
-- compare_columns 用逗号分隔需要比对的列名"""
+- RCT1 关联发票用 InvEntry，关联收款单用 DocEntry"""
 
 VERIFY_SQL_PROMPT = """为以下存储过程生成业务校验 SQL。
 
