@@ -25,6 +25,7 @@ class AgentState(TypedDict):
     verify_results: list
     status: str
     error: str
+    clarify_count: int
 
 
 def _get_llm() -> ChatOpenAI:
