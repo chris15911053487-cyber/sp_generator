@@ -37,8 +37,36 @@ def _get_llm() -> ChatOpenAI:
     )
 
 
-def _invoke_with_tools(llm: ChatOpenAI, messages: list, max_rounds: int = 5) -> AIMessage:
-    """调用 LLM 并自动处理 tool calling 循环，直到 LLM 不再调 tool 为止。"""
+def _parse_dsml_tool_calls(content: str) -> list[tuple[str, dict]]:
+    """解析 DeepSeek 非标准 DSML 格式的工具调用。
+
+    格式形如：
+      <｜｜DSML｜｜tool_calls>
+      <｜｜DSML｜｜invoke name="run_sql_tool">
+      <｜｜DSML｜｜parameter name="sql" string="true">SELECT ...</｜｜DSML｜｜parameter>
+      </｜｜DSML｜｜invoke>
+      </｜｜DSML｜｜tool_calls>
+
+    返回 [(tool_name, args_dict), ...]。
+    """
+    calls = []
+    for inv in re.finditer(r'<｜｜DSML｜｜invoke name="([^"]+)">(.*?)</｜｜DSML｜｜invoke>', content, re.DOTALL):
+        name = inv.group(1)
+        body = inv.group(2)
+        args = {}
+        for p in re.finditer(r'<｜｜DSML｜｜parameter name="([^"]+)"[^>]*>(.*?)</｜｜DSML｜｜parameter>', body, re.DOTALL):
+            args[p.group(1)] = p.group(2).strip()
+        calls.append((name, args))
+    return calls
+
+
+def _invoke_with_tools(llm: ChatOpenAI, messages: list, max_rounds: int = 8) -> AIMessage:
+    """调用 LLM 并自动处理 tool calling 循环，直到 LLM 不再调 tool 为止。
+
+    兼容两种工具调用格式：
+    - 标准 OpenAI function calling（response.tool_calls）
+    - DeepSeek 间歇性输出的 DSML 文本格式（LangChain 不识别，需手动解析执行）
+    """
     tools = create_tools()
     tool_map = {t.name: t for t in tools}
     llm_with_tools = llm.bind_tools(tools)
@@ -46,27 +74,44 @@ def _invoke_with_tools(llm: ChatOpenAI, messages: list, max_rounds: int = 5) -> 
     for _ in range(max_rounds):
         response = llm_with_tools.invoke(messages)
 
-        # 如果 LLM 没有请求调 tool，直接返回
-        if not response.tool_calls:
-            return response
+        # 1) 标准工具调用：append AIMessage + ToolMessage
+        if response.tool_calls:
+            messages.append(response)
+            for tc in response.tool_calls:
+                tool_fn = tool_map.get(tc["name"])
+                if tool_fn:
+                    try:
+                        result = tool_fn.invoke(tc["args"])
+                    except Exception as e:
+                        result = f"工具执行失败: {e}"
+                else:
+                    result = f"未知工具: {tc['name']}"
+                messages.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
+            continue
 
-        # 将 AIMessage（含 tool_calls）追加到消息列表
-        messages.append(response)
+        # 2) DSML 非标准工具调用：解析执行，结果作为 HumanMessage 追加
+        #    （不 append 含 DSML 的 AIMessage，避免 tool_call_id 配对报错）
+        content = response.content or ""
+        dsml_calls = _parse_dsml_tool_calls(content) if "<｜｜DSML｜｜" in content else []
+        if dsml_calls:
+            result_parts = []
+            for name, args in dsml_calls:
+                tool_fn = tool_map.get(name)
+                if tool_fn:
+                    try:
+                        result = tool_fn.invoke(args)
+                    except Exception as e:
+                        result = f"工具执行失败: {e}"
+                else:
+                    result = f"未知工具: {name}"
+                result_parts.append(f"[工具 {name} 执行结果]\n{result}")
+            messages.append(HumanMessage(content="\n\n".join(result_parts)))
+            continue
 
-        # 逐个执行 tool，将结果作为 ToolMessage 追加
-        for tc in response.tool_calls:
-            tool_fn = tool_map.get(tc["name"])
-            if tool_fn:
-                try:
-                    result = tool_fn.invoke(tc["args"])
-                except Exception as e:
-                    result = f"工具执行失败: {e}"
-            else:
-                result = f"未知工具: {tc['name']}"
-            messages.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
+        # 3) 无工具调用：最终响应
+        return response
 
-    # 工具调用循环耗尽：LLM 仍想调工具时，用不带工具的 LLM 强制生成最终响应，
-    # 避免 content 为自然语言/空导致下游 JSON 解析失败。
+    # 循环耗尽：用不带工具的 LLM 强制生成最终响应
     return llm.invoke(messages)
 
 
@@ -225,11 +270,6 @@ def generate_node(state: AgentState, config: dict = None) -> dict:
     session_id = state["session_id"]
     design = state["design"]
 
-    # 删除该会话下的旧 SP（级联删除校验 SQL），确保只保留最新
-    deleted = delete_sps_by_session(session_id)
-    if deleted > 0:
-        print(f"[generate_node] 已删除 {deleted} 个旧 SP", flush=True)
-
     # === 阶段 1：生成存储过程代码 ===
     prompt = GENERATE_PROMPT.format(design=design)
     messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=prompt)]
@@ -238,10 +278,15 @@ def generate_node(state: AgentState, config: dict = None) -> dict:
     print(f"[DEBUG generate_node] parsed={'OK' if data else 'FAIL'}, procedures={len(data.get('procedures',[])) if data else 0}", flush=True)
 
     if data is None:
+        # FAIL 时不删除旧 SP：避免删了旧的又没存新的，导致 DB 变空、
+        # 而 state.sp_list 仍残留旧值，造成"校验全对但右侧全空"的不一致
         return {
             "error": f"无法解析 LLM 响应为 JSON: {response.content[:500]}",
             "raw_response": response.content,
         }
+
+    # parsed OK：删除该会话下的旧 SP（级联删除校验 SQL），再保存新的
+    delete_sps_by_session(session_id)
 
     sp_list = []
     for proc in data.get("procedures", []):
