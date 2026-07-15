@@ -4,11 +4,13 @@ import re
 from typing import TypedDict
 from langgraph.types import interrupt
 from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
 from app.agent.prompts import (
     SYSTEM_PROMPT, CLARIFY_PROMPT, DESIGN_PROMPT,
     GENERATE_PROMPT, VERIFY_SQL_PROMPT, VERIFY_PROMPT,
 )
-from app.db.sqlserver import check_syntax, execute_query, deploy_procedure
+from app.agent.tools import create_tools
+from app.db.sqlserver import check_syntax, execute_query, deploy_procedure, substitute_params
 from app.db.sqlite import save_sp, save_verify_query, get_messages
 from config import get_llm_config
 
@@ -33,6 +35,39 @@ def _get_llm() -> ChatOpenAI:
         model=cfg["model_name"],
         temperature=0.1,
     )
+
+
+def _invoke_with_tools(llm: ChatOpenAI, messages: list, max_rounds: int = 5) -> AIMessage:
+    """调用 LLM 并自动处理 tool calling 循环，直到 LLM 不再调 tool 为止。"""
+    tools = create_tools()
+    tool_map = {t.name: t for t in tools}
+    llm_with_tools = llm.bind_tools(tools)
+
+    for _ in range(max_rounds):
+        response = llm_with_tools.invoke(messages)
+
+        # 如果 LLM 没有请求调 tool，直接返回
+        if not response.tool_calls:
+            return response
+
+        # 将 AIMessage（含 tool_calls）追加到消息列表
+        messages.append(response)
+
+        # 逐个执行 tool，将结果作为 ToolMessage 追加
+        for tc in response.tool_calls:
+            tool_fn = tool_map.get(tc["name"])
+            if tool_fn:
+                try:
+                    result = tool_fn.invoke(tc["args"])
+                except Exception as e:
+                    result = f"工具执行失败: {e}"
+            else:
+                result = f"未知工具: {tc['name']}"
+            messages.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
+
+    # 工具调用循环耗尽：LLM 仍想调工具时，用不带工具的 LLM 强制生成最终响应，
+    # 避免 content 为自然语言/空导致下游 JSON 解析失败。
+    return llm.invoke(messages)
 
 
 def _build_chat_history(session_id: str, max_msgs: int = 10) -> str:
@@ -65,7 +100,8 @@ def clarify_node(state: AgentState, config: dict = None) -> dict:
         chat_history=chat_history,
         clarified_info=clarified or "暂无",
     )
-    response = llm.invoke([("system", SYSTEM_PROMPT), ("user", prompt)])
+    messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=prompt)]
+    response = _invoke_with_tools(llm, messages)
 
     if "INFO_SUFFICIENT" in response.content:
         return {
@@ -94,7 +130,8 @@ def design_node(state: AgentState, config: dict = None) -> dict:
     """方案设计节点 — 基于需求生成方案，等待用户确认。"""
     llm = _get_llm()
     prompt = DESIGN_PROMPT.format(requirements=state["requirements"])
-    response = llm.invoke([("system", SYSTEM_PROMPT), ("user", prompt)])
+    messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=prompt)]
+    response = _invoke_with_tools(llm, messages)
     design = response.content
 
     decision = interrupt({"type": "design", "content": design})
@@ -150,21 +187,6 @@ def _parse_sql_placeholders(sql_code: str) -> set[str]:
     return set(re.findall(r'\{(\w+)\}', sql_code))
 
 
-def _substitute_params_sql(sql: str, params: dict) -> str:
-    """将 SQL 中的 {param_name} 占位符替换为实际值。"""
-    if not params:
-        return sql
-    def replacer(m):
-        key = m.group(1)
-        if key in params:
-            val = params[key]
-            if isinstance(val, str):
-                return f"'{val}'"
-            return str(val)
-        return m.group(0)
-    return re.sub(r'\{(\w+)\}', replacer, sql)
-
-
 def _merge_parameters(sp_params: list[dict], sql_placeholders: set[str],
                       llm_params: list[dict]) -> list[dict]:
     """合并 SP 参数 + 校验 SQL 占位符 + LLM 默认值，取并集"""
@@ -210,7 +232,8 @@ def generate_node(state: AgentState, config: dict = None) -> dict:
 
     # === 阶段 1：生成存储过程代码 ===
     prompt = GENERATE_PROMPT.format(design=design)
-    response = llm.invoke([("system", SYSTEM_PROMPT), ("user", prompt)])
+    messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=prompt)]
+    response = _invoke_with_tools(llm, messages)
     data = _parse_json(response.content)
     print(f"[DEBUG generate_node] parsed={'OK' if data else 'FAIL'}, procedures={len(data.get('procedures',[])) if data else 0}", flush=True)
 
@@ -238,13 +261,14 @@ def generate_node(state: AgentState, config: dict = None) -> dict:
         sql_placeholders: set[str] = set()
         llm_params: list = []
 
-        # 2. 生成校验 SQL
+        # 2. 生成校验 SQL（LLM 可调用 tools 确认表结构）
         vq_prompt = VERIFY_SQL_PROMPT.format(
             sp_name=sp_row["name"],
             sp_code=sp_row["code"],
             design=design,
         )
-        vq_response = llm.invoke([("system", SYSTEM_PROMPT), ("user", vq_prompt)])
+        vq_messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=vq_prompt)]
+        vq_response = _invoke_with_tools(llm, vq_messages)
         vq_data = _parse_json(vq_response.content)
 
         if vq_data:
@@ -326,7 +350,7 @@ def verify_node(state: AgentState, config: dict = None) -> dict:
         biz_all_ok = True
         for vq in vqs:
             try:
-                sql_to_run = _substitute_params_sql(vq["sql_code"], params)
+                sql_to_run = substitute_params(vq["sql_code"], params)
                 verify_rows = execute_query(sql_to_run)
                 update_verify_query(vq["id"], status="pass", result_detail=json.dumps(verify_rows[:20], ensure_ascii=False, indent=2))
                 sp_result["details"].append(

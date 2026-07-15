@@ -1,10 +1,9 @@
 """校验管理 API — 语法校验、业务校验。"""
 import json
-import re
 from fastapi import APIRouter
 from pydantic import BaseModel
 from app.db.sqlite import get_sps, get_verify_queries, update_sp, update_verify_query
-from app.db.sqlserver import check_syntax, execute_query
+from app.db.sqlserver import check_syntax, execute_query, substitute_params
 
 router = APIRouter(prefix="/api/verify", tags=["verify"])
 
@@ -17,22 +16,6 @@ class VerifySpRequest(BaseModel):
 class UpdateVqRequest(BaseModel):
     sql_code: str | None = None
     name: str | None = None
-
-
-def _substitute_params(sql: str, params: dict) -> str:
-    """将 SQL 中的 {param_name} 占位符替换为实际值。"""
-    if not params:
-        return sql
-    def replacer(m):
-        key = m.group(1)
-        if key in params:
-            val = params[key]
-            # 字符串类型加引号
-            if isinstance(val, str):
-                return f"'{val}'"
-            return str(val)
-        return m.group(0)  # 未找到参数，保持原样
-    return re.sub(r'\{(\w+)\}', replacer, sql)
 
 
 @router.post("/syntax/{session_id}/{sp_id}")
@@ -67,7 +50,7 @@ def api_check_business(sp_id: str, req: VerifySpRequest = None):
     results = []
     for vq in vqs:
         try:
-            sql_to_run = _substitute_params(vq["sql_code"], params)
+            sql_to_run = substitute_params(vq["sql_code"], params)
             rows = execute_query(sql_to_run)
             update_verify_query(vq["id"], status="pass", result_detail=json.dumps(rows[:20], ensure_ascii=False, indent=2))
             results.append({"query_id": vq["id"], "name": vq["name"], "pass": True, "data": rows[:10]})
@@ -143,7 +126,7 @@ def api_verify_single_sp(sp_id: str, req: VerifySpRequest = None):
     biz_all_ok = True
     for vq in vqs:
         try:
-            sql_to_run = _substitute_params(vq["sql_code"], params)
+            sql_to_run = substitute_params(vq["sql_code"], params)
             rows = execute_query(sql_to_run)
             update_verify_query(vq["id"], status="pass", result_detail=json.dumps(rows[:20], ensure_ascii=False, indent=2))
             biz_results.append({"query_id": vq["id"], "name": vq["name"], "pass": True, "data": rows[:10]})
@@ -201,7 +184,7 @@ def api_verify_all(session_id: str):
         biz_results = []
         for vq in vqs:
             try:
-                sql_to_run = _substitute_params(vq["sql_code"], params)
+                sql_to_run = substitute_params(vq["sql_code"], params)
                 rows = execute_query(sql_to_run)
                 update_verify_query(vq["id"], status="pass", result_detail=json.dumps(rows[:20], ensure_ascii=False, indent=2))
                 biz_results.append({"query_id": vq["id"], "name": vq["name"], "pass": True})
