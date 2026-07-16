@@ -2,12 +2,14 @@
 import json
 import re
 from typing import TypedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from langgraph.types import interrupt
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
 from app.agent.prompts import (
     SYSTEM_PROMPT, CLARIFY_PROMPT, DESIGN_PROMPT,
     GENERATE_PROMPT, VERIFY_SQL_PROMPT, VERIFY_PROMPT,
+    DESIGN_FEEDBACK_PROMPT, FIX_SP_PROMPT,
 )
 from app.agent.tools import create_tools
 from app.db.sqlserver import check_syntax, execute_query, deploy_procedure, substitute_params
@@ -26,6 +28,10 @@ class AgentState(TypedDict):
     status: str
     error: str
     clarify_count: int
+    # 设计反馈阶段控制："new"=初次设计, "feedback"=修改后确认, None=完成
+    design_phase: str | None
+    # 上一次 LLM 对用户反馈的回复，供 chat.py 展示
+    last_feedback_reply: str
 
 
 def _get_llm() -> ChatOpenAI:
@@ -143,6 +149,26 @@ def _extract_first_question(content: str) -> str:
     return content
 
 
+def _classify_design_feedback(llm: ChatOpenAI, design: str, feedback: str) -> tuple[str, str, str]:
+    """调用 LLM 对设计反馈进行意图分类。
+
+    返回 (intent, reply, new_design)。
+    intent: "CONFIRM" | "MODIFY" | "IRRELEVANT"
+    """
+    prompt = DESIGN_FEEDBACK_PROMPT.format(design=design, user_feedback=feedback)
+    messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=prompt)]
+    # 意图分类不需要工具，纯 llm.invoke 减少延迟
+    response = llm.invoke(messages)
+    data = _parse_json(response.content)
+    if data:
+        return (
+            data.get("intent", "IRRELEVANT"),
+            data.get("reply", ""),
+            data.get("new_design", ""),
+        )
+    return "IRRELEVANT", "无法理解您的反馈，请确认方案或提出修改意见。", ""
+
+
 def clarify_node(state: AgentState, config: dict = None) -> dict:
     """需求澄清节点 — 系统控制编号，最多 5 个问题，可提前结束。"""
     llm = _get_llm()
@@ -185,7 +211,7 @@ def clarify_node(state: AgentState, config: dict = None) -> dict:
         last_question_hint=last_question_hint,
     )
     messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=prompt)]
-    response = _invoke_with_tools(llm, messages)
+    response = _invoke_with_tools(llm, messages, max_rounds=1)
 
     if "INFO_SUFFICIENT" in response.content:
         return {
@@ -214,22 +240,127 @@ def clarify_node(state: AgentState, config: dict = None) -> dict:
 
 
 def design_node(state: AgentState, config: dict = None) -> dict:
-    """方案设计节点 — 基于需求生成方案，等待用户确认。"""
+    """方案设计节点 — 基于需求生成方案，支持多轮反馈确认。"""
     llm = _get_llm()
-    prompt = DESIGN_PROMPT.format(requirements=state["requirements"])
-    messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=prompt)]
-    response = _invoke_with_tools(llm, messages)
-    design = response.content
+    design_phase = state.get("design_phase")
+    design = state.get("design", "")
 
-    decision = interrupt({"type": "design", "content": design})
+    if design_phase == "feedback":
+        # === 第二阶段：展示修改后方案，再次等待确认 ===
+        reply = state.get("last_feedback_reply", "")
+        content = design
+        if reply:
+            content = f"{reply}\n\n{content}"
 
+        decision = interrupt({"type": "design", "content": content, "phase": "feedback"})
+
+        if isinstance(decision, dict) and decision.get("action") == "modify":
+            design = decision.get("design", design)
+            return {
+                "design": design,
+                "mode": "generate",
+                "status": "designed",
+                "design_phase": None,
+                "last_feedback_reply": "",
+            }
+
+        if isinstance(decision, str) and decision.strip():
+            intent, reply2, new_design = _classify_design_feedback(llm, design, decision.strip())
+            if intent == "CONFIRM":
+                return {
+                    "design": design,
+                    "mode": "generate",
+                    "status": "designed",
+                    "design_phase": None,
+                    "last_feedback_reply": "",
+                }
+            elif intent == "MODIFY" and new_design:
+                return {
+                    "design": new_design,
+                    "mode": "design",
+                    "status": "designed",
+                    "design_phase": "feedback",
+                    "last_feedback_reply": reply2 or "方案已按您的意见修改，请确认。",
+                }
+            else:
+                # IRRELEVANT
+                hint = reply2 or "您的回复与当前方案无关，请确认方案或提出修改意见。"
+                interrupt({"type": "design", "content": design, "reply": hint, "phase": "feedback"})
+                return {
+                    "design": design,
+                    "mode": "design",
+                    "status": "designed",
+                    "design_phase": "feedback",
+                    "last_feedback_reply": hint,
+                }
+
+        # 空响应视为确认
+        return {
+            "design": design,
+            "mode": "generate",
+            "status": "designed",
+            "design_phase": None,
+            "last_feedback_reply": "",
+        }
+
+    # === 第一阶段：初次生成方案（如已有方案则复用，避免 IRRELEVANT 循环时重新生成） ===
+    design = state.get("design", "")
+    if not design:
+        prompt = DESIGN_PROMPT.format(requirements=state["requirements"])
+        messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=prompt)]
+        response = _invoke_with_tools(llm, messages, max_rounds=3)
+        design = response.content
+
+    decision = interrupt({"type": "design", "content": design, "phase": "new"})
+
+    # dict 修改（前端手动修改推送）
     if isinstance(decision, dict) and decision.get("action") == "modify":
-        design = decision.get("design", design)
+        return {
+            "design": decision.get("design", design),
+            "mode": "generate",
+            "status": "designed",
+            "design_phase": None,
+            "last_feedback_reply": "",
+        }
 
+    # 文本反馈分类
+    if isinstance(decision, str) and decision.strip():
+        intent, reply, new_design = _classify_design_feedback(llm, design, decision.strip())
+        if intent == "CONFIRM":
+            return {
+                "design": design,
+                "mode": "generate",
+                "status": "designed",
+                "design_phase": None,
+                "last_feedback_reply": "",
+            }
+        elif intent == "MODIFY" and new_design:
+            return {
+                "design": new_design,
+                "mode": "design",
+                "status": "designed",
+                "design_phase": "feedback",
+                "last_feedback_reply": reply or "方案已按您的意见修改，请确认。",
+            }
+        else:
+            # IRRELEVANT
+            hint = reply or "您的回复与当前方案无关，请确认方案或提出修改意见。"
+            interrupt({"type": "design", "content": design, "reply": hint, "phase": "new"})
+            return {
+                "design": design,
+                "mode": "design",
+                "status": "designed",
+                "design_phase": "new",
+                "last_feedback_reply": hint,
+            }
+
+    # 默认：空响应视为确认
     return {
         "design": design,
         "mode": "generate",
         "status": "designed",
+        "design_phase": None,
+        "last_feedback_reply": "",
     }
 
 
@@ -304,6 +435,53 @@ def _merge_parameters(sp_params: list[dict], sql_placeholders: set[str],
     return list(param_map.values())
 
 
+def _generate_verify_sql_for_sp(llm: ChatOpenAI, sp_row: dict, design: str) -> dict:
+    """为单个 SP 生成校验 SQL（可并行调用）。返回更新后的 sp_row。"""
+    sp_params = _parse_sp_params(sp_row.get("code", ""))
+    verify_queries: list = []
+    sql_placeholders: set[str] = set()
+    llm_params: list = []
+
+    vq_prompt = VERIFY_SQL_PROMPT.format(
+        sp_name=sp_row["name"],
+        sp_code=sp_row["code"],
+        design=design,
+    )
+    vq_messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=vq_prompt)]
+    vq_response = _invoke_with_tools(llm, vq_messages, max_rounds=3)
+    vq_data = _parse_json(vq_response.content)
+
+    if vq_data:
+        raw_queries = vq_data.get("verify_queries", [])
+        if isinstance(raw_queries, list):
+            verify_queries = raw_queries
+        for vq in verify_queries:
+            if not isinstance(vq, dict):
+                continue
+            save_verify_query(
+                sp_row["id"],
+                vq.get("name", "未命名校验"),
+                vq.get("sql_code", ""),
+                vq.get("compare_columns", ""),
+            )
+            sql_placeholders |= _parse_sql_placeholders(vq.get("sql_code", ""))
+        llm_params = vq_data.get("parameters", [])
+
+    # 合并参数并集
+    print(f"[DEBUG params] SP={sp_row['name']}", flush=True)
+    print(f"[DEBUG params]   sp_params from code: {sp_params}", flush=True)
+    print(f"[DEBUG params]   sql_placeholders: {sql_placeholders}", flush=True)
+    print(f"[DEBUG params]   llm_params: {llm_params}", flush=True)
+    merged = _merge_parameters(sp_params, sql_placeholders, llm_params)
+    print(f"[DEBUG params]   merged={merged}", flush=True)
+    if merged:
+        from app.db.sqlite import update_sp as db_update_sp2
+        db_update_sp2(sp_row["id"], parameters=json.dumps(merged, ensure_ascii=False))
+        sp_row["parameters"] = json.dumps(merged, ensure_ascii=False)
+
+    return sp_row
+
+
 def generate_node(state: AgentState, config: dict = None) -> dict:
     """代码生成节点 — 两阶段：先生成 SP，再为每个 SP 单独生成校验 SQL。"""
     from app.db.sqlite import delete_sps_except
@@ -315,7 +493,7 @@ def generate_node(state: AgentState, config: dict = None) -> dict:
     # === 阶段 1：生成存储过程代码 ===
     prompt = GENERATE_PROMPT.format(design=design)
     messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=prompt)]
-    response = _invoke_with_tools(llm, messages)
+    response = _invoke_with_tools(llm, messages, max_rounds=8)
     data = _parse_json(response.content)
     print(f"[DEBUG generate_node] parsed={'OK' if data else 'FAIL'}, procedures={len(data.get('procedures',[])) if data else 0}", flush=True)
 
@@ -338,53 +516,21 @@ def generate_node(state: AgentState, config: dict = None) -> dict:
         sp = save_sp(session_id, proc["name"], code)
         sp_row = dict(sp) if not isinstance(sp, dict) else sp
         sp_list.append(sp_row)
-    # === 阶段 2：为每个 SP 单独生成校验 SQL ===
+    # === 阶段 2：并行生成校验 SQL ===
     # 注意：旧 SP 暂不删除，等阶段 2 全部完成后统一替换，
     # 避免校验 SQL 生成中途出错导致旧 SP 已丢、新 SP 不完整
-    for sp_row in sp_list:
-        # 1. 先从 SP 代码解析 @参数 声明（始终执行，不依赖 LLM）
-        sp_params = _parse_sp_params(sp_row.get("code", ""))
-        verify_queries: list = []
-        sql_placeholders: set[str] = set()
-        llm_params: list = []
-
-        # 2. 生成校验 SQL（LLM 可调用 tools 确认表结构）
-        vq_prompt = VERIFY_SQL_PROMPT.format(
-            sp_name=sp_row["name"],
-            sp_code=sp_row["code"],
-            design=design,
-        )
-        vq_messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=vq_prompt)]
-        vq_response = _invoke_with_tools(llm, vq_messages)
-        vq_data = _parse_json(vq_response.content)
-
-        if vq_data:
-            raw_queries = vq_data.get("verify_queries", [])
-            if isinstance(raw_queries, list):
-                verify_queries = raw_queries
-            for vq in verify_queries:
-                if not isinstance(vq, dict):
-                    continue
-                save_verify_query(
-                    sp_row["id"],
-                    vq.get("name", "未命名校验"),
-                    vq.get("sql_code", ""),
-                    vq.get("compare_columns", ""),
-                )
-                sql_placeholders |= _parse_sql_placeholders(vq.get("sql_code", ""))
-            llm_params = vq_data.get("parameters", [])
-
-        # 3. 合并参数并集（SP @参数 + 校验SQL {参数} + LLM defaults）
-        print(f"[DEBUG params] SP={sp_row['name']}", flush=True)
-        print(f"[DEBUG params]   sp_params from code: {sp_params}", flush=True)
-        print(f"[DEBUG params]   sql_placeholders: {sql_placeholders}", flush=True)
-        print(f"[DEBUG params]   llm_params: {llm_params}", flush=True)
-        merged = _merge_parameters(sp_params, sql_placeholders, llm_params)
-        print(f"[DEBUG params]   merged={merged}", flush=True)
-        if merged:
-            from app.db.sqlite import update_sp as db_update_sp2
-            db_update_sp2(sp_row["id"], parameters=json.dumps(merged, ensure_ascii=False))
-            sp_row["parameters"] = json.dumps(merged, ensure_ascii=False)
+    MAX_PARALLEL = 3  # 最大并行数，避免 LLM API 限流
+    with ThreadPoolExecutor(max_workers=MAX_PARALLEL) as executor:
+        futures = {
+            executor.submit(_generate_verify_sql_for_sp, llm, sp_row, design): sp_row
+            for sp_row in sp_list
+        }
+        for future in as_completed(futures):
+            sp_row = futures[future]
+            try:
+                future.result()
+            except Exception as e:
+                print(f"[ERROR] 校验 SQL 生成失败: {sp_row.get('name')}: {e}", flush=True)
 
     # 新 SP 全部就绪（代码 + 参数 + 校验 SQL），现在替换旧 SP
     delete_sps_except(session_id, [s["id"] for s in sp_list])
@@ -397,11 +543,13 @@ def generate_node(state: AgentState, config: dict = None) -> dict:
 
 
 def verify_node(state: AgentState, config: dict = None) -> dict:
-    """校验节点 — 对每个 SP 执行语法校验和业务校验。"""
+    """校验节点 — 语法+业务校验，失败时自动修复（最多 2 次迭代）。"""
     from app.db.sqlite import get_verify_queries, get_sps, update_sp as db_update_sp, update_verify_query
 
+    llm = _get_llm()
+
     sp_list = state.get("sp_list", [])
-    # 回退：如果状态中 sp_list 为空，从数据库加载（避免 LangGraph 状态传递问题）
+    # 回退：如果状态中 sp_list 为空，从数据库加载
     if not sp_list:
         session_id = state.get("session_id", "")
         if session_id:
@@ -413,51 +561,88 @@ def verify_node(state: AgentState, config: dict = None) -> dict:
 
     results = []
     all_pass = True
+    MAX_FIX_ROUNDS = 2  # 最多 2 次自动修复
 
     for sp in sp_list:
         sp_result = {"sp_id": sp["id"], "sp_name": sp.get("name", ""), "syntax_ok": False, "business_ok": False, "details": []}
+        # 用局部变量跟踪当前代码，不直接改 sp_list
+        current_code = sp["code"]
 
-        # 语法校验
-        ok, err = check_syntax(sp["code"])
-        sp_result["syntax_ok"] = ok
-        if not ok:
-            sp_result["details"].append({"type": "syntax", "pass": False, "error": err})
-            all_pass = False
-            db_update_sp(sp["id"], syntax_valid=0)
-        else:
-            db_update_sp(sp["id"], syntax_valid=1)
+        for fix_round in range(MAX_FIX_ROUNDS + 1):  # 初始 + 最多 MAX_FIX_ROUNDS 次修复
+            # === 语法校验 ===
+            syntax_ok, syntax_err = check_syntax(current_code)
 
-        # 业务校验
-        vqs = get_verify_queries(sp["id"])
-        # 加载默认参数
-        params = {}
-        try:
-            param_list = json.loads(sp.get("parameters", "[]"))
-            params = {p["name"]: p.get("default", "") for p in param_list if p.get("default")}
-        except (json.JSONDecodeError, KeyError, TypeError):
-            pass
-
-        biz_all_ok = True
-        for vq in vqs:
+            # === 业务校验 ===
+            vqs = get_verify_queries(sp["id"])
+            params = {}
             try:
-                sql_to_run = substitute_params(vq["sql_code"], params)
-                verify_rows = execute_query(sql_to_run)
-                update_verify_query(vq["id"], status="pass", result_detail=json.dumps(verify_rows[:20], ensure_ascii=False, indent=2))
-                sp_result["details"].append(
-                    {"type": "business", "pass": True, "query": vq["name"], "data": verify_rows[:10]}
-                )
-            except Exception as e:
-                biz_all_ok = False
-                all_pass = False
-                update_verify_query(vq["id"], status="fail", result_detail=str(e))
-                sp_result["details"].append(
-                    {"type": "business", "pass": False, "query": vq["name"], "error": str(e)}
-                )
+                param_list = json.loads(sp.get("parameters", "[]"))
+                params = {p["name"]: p.get("default", "") for p in param_list if p.get("default")}
+            except (json.JSONDecodeError, KeyError, TypeError):
+                pass
 
-        sp_result["business_ok"] = biz_all_ok
-        db_update_sp(sp["id"], business_valid=1 if biz_all_ok else 0)
+            biz_all_ok = True
+            biz_errors = []
+            for vq in vqs:
+                try:
+                    sql_to_run = substitute_params(vq["sql_code"], params)
+                    verify_rows = execute_query(sql_to_run)
+                    update_verify_query(vq["id"], status="pass", result_detail=json.dumps(verify_rows[:20], ensure_ascii=False, indent=2))
+                except Exception as e:
+                    biz_all_ok = False
+                    biz_errors.append({"query": vq["name"], "error": str(e)})
+                    update_verify_query(vq["id"], status="fail", result_detail=str(e))
+
+            # 全部通过 → 跳出修复循环
+            if syntax_ok and biz_all_ok:
+                sp_result["syntax_ok"] = True
+                sp_result["business_ok"] = True
+                break
+
+            # 最后一轮仍未通过 → 记录结果
+            if fix_round >= MAX_FIX_ROUNDS:
+                sp_result["syntax_ok"] = syntax_ok
+                sp_result["business_ok"] = biz_all_ok
+                if not syntax_ok:
+                    sp_result["details"].append({"type": "syntax", "pass": False, "error": syntax_err})
+                for be in biz_errors:
+                    sp_result["details"].append({
+                        "type": "business", "pass": False,
+                        "query": be["query"], "error": be["error"],
+                    })
+                all_pass = False
+                break
+
+            # === 告知用户进度（interrupt 让 chat.py 向用户发送 SSE）===
+            interrupt({
+                "type": "auto_fix_progress",
+                "message": f"校验失败，正在自动修正（第 {fix_round + 1}/{MAX_FIX_ROUNDS} 次）...",
+                "sp_name": sp.get("name", ""),
+            })
+
+            # === 调用 LLM 修复代码 ===
+            errors_text = []
+            if not syntax_ok:
+                errors_text.append(f"[语法错误] {syntax_err}")
+            if biz_errors:
+                errors_text.append(f"[业务校验失败] {json.dumps(biz_errors, ensure_ascii=False)}")
+
+            fix_prompt = FIX_SP_PROMPT.format(
+                sp_name=sp.get("name", ""),
+                sp_code=current_code,
+                errors="\n".join(errors_text),
+            )
+            fix_messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=fix_prompt)]
+            fix_response = _invoke_with_tools(llm, fix_messages, max_rounds=2)
+            fix_data = _parse_json(fix_response.content)
+
+            if fix_data and fix_data.get("fixed_code"):
+                current_code = fix_data["fixed_code"]
+                db_update_sp(sp["id"], code=current_code)
 
         # 更新 SP 状态
+        db_update_sp(sp["id"], syntax_valid=1 if sp_result["syntax_ok"] else 0)
+        db_update_sp(sp["id"], business_valid=1 if sp_result["business_ok"] else 0)
         sp_status = "verified" if sp_result["syntax_ok"] and sp_result["business_ok"] else "verify_failed"
         db_update_sp(sp["id"], status=sp_status, verify_result=str(sp_result))
         results.append(sp_result)

@@ -72,6 +72,8 @@ async def api_chat_stream(req: ChatRequest):
                         "status": "",
                         "error": "",
                         "clarify_count": state.values.get("clarify_count", 0) if state.values else 0,
+                        "design_phase": state.values.get("design_phase") if state.values else None,
+                        "last_feedback_reply": state.values.get("last_feedback_reply", "") if state.values else "",
                     }
                     events = graph.stream(new_input, config)
                 else:
@@ -93,6 +95,8 @@ async def api_chat_stream(req: ChatRequest):
                     "status": state.values.get("status", ""),
                     "error": state.values.get("error", ""),
                     "clarify_count": state.values.get("clarify_count", 0),
+                    "design_phase": state.values.get("design_phase"),
+                    "last_feedback_reply": state.values.get("last_feedback_reply", ""),
                 }
                 events = graph.stream(input_state, config)
             else:
@@ -108,77 +112,120 @@ async def api_chat_stream(req: ChatRequest):
                     "status": "",
                     "error": "",
                     "clarify_count": 0,
+                    "design_phase": None,
+                    "last_feedback_reply": "",
                 }
                 events = graph.stream(input_state, config)
 
             assistant_response = ""
             generate_failed = False  # generate 失败时不再用 verify 结果覆盖，避免"校验全对但右侧旧SP"误导
 
-            for event in events:
-                for node_name, node_output in event.items():
-                    if isinstance(node_output, dict):
-                        if node_output.get("error"):
-                            # generate 等节点出错（如 LLM 响应解析失败）
-                            generate_failed = True
-                            assistant_response = (
-                                f"❌ 生成失败：{node_output['error'][:300]}\n\n"
-                                "存储过程未能生成，右侧仍显示上一次的结果。请重新确认设计方案后重试。"
-                            )
-                            yield f"data: {json.dumps({'type': 'error', 'content': assistant_response})}\n\n"
+            def _handle_event():
+                """处理单个事件流，返回是否需要继续处理后续中断（auto_fix 场景）。
+                注意：用 nonlocal 修改外层 assistant_response 和 generate_failed。
+                """
+                nonlocal assistant_response, generate_failed
 
-                        if node_output.get("status") == "generated":
-                            sp_list = node_output.get("sp_list", [])
-                            assistant_response = f"已生成 {len(sp_list)} 个存储过程。\n"
-                            for sp in sp_list:
-                                assistant_response += f"- {sp['name']}\n"
-                            assistant_response += "\n正在校验..."
+                for event in events:
+                    for node_name, node_output in event.items():
+                        if isinstance(node_output, dict):
+                            if node_output.get("error"):
+                                # generate 等节点出错（如 LLM 响应解析失败）
+                                generate_failed = True
+                                assistant_response = (
+                                    f"❌ 生成失败：{node_output['error'][:300]}\n\n"
+                                    "存储过程未能生成，右侧仍显示上一次的结果。请重新确认设计方案后重试。"
+                                )
+                                yield f"data: {json.dumps({'type': 'error', 'content': assistant_response})}\n\n"
 
-                        elif node_output.get("status") in ("verified", "verify_failed"):
-                            # generate 已失败时跳过 verify 结果，避免用旧 SP 的校验结果误导用户
-                            if generate_failed:
-                                yield f"data: {json.dumps({'node': node_name, 'data': node_output, 'type': 'update'})}\n\n"
-                                continue
-                            v_results = node_output.get("verify_results", [])
-                            print(f"[DEBUG verify_result] status={node_output.get('status')}, v_results count={len(v_results)}", flush=True)
-                            for i, vr in enumerate(v_results):
-                                print(f"[DEBUG verify_result]   [{i}] sp_id={vr.get('sp_id','?')[:8]}, syntax_ok={vr.get('syntax_ok')}, biz_ok={vr.get('business_ok')}, details={len(vr.get('details',[]))}", flush=True)
-                            lines = ["\n--- 校验结果 ---"]
-                            if v_results:
-                                for vr in v_results:
-                                    sp_name = vr.get("sp_name", vr.get("sp_id", "")[:8])
-                                    syn = "✅" if vr.get("syntax_ok") else "❌"
-                                    biz = "✅" if vr.get("business_ok") else "❌"
-                                    lines.append(f"📄 {sp_name}")
-                                    lines.append(f"   {syn} 语法  {biz} 业务")
-                                    for d in vr.get("details", []):
-                                        if d.get("type") == "syntax" and not d.get("pass"):
-                                            lines.append(f"   语法错误: {d.get('error', '')[:120]}")
-                                        elif d.get("type") == "business":
-                                            mark = "✅" if d.get("pass") else "❌"
-                                            detail = d.get('data', d.get('error', ''))
-                                            detail_str = str(detail)[:120] if detail else ''
-                                            lines.append(f"   {mark} {d.get('query', '')}: {detail_str}")
-                            else:
-                                lines.append("⚠️ 校验结果为空，可能未生成存储过程")
-                            assistant_response = "\n".join(lines)
-                            yield f"data: {json.dumps({'type': 'verify_result', 'content': assistant_response, 'data': node_output})}\n\n"
+                            if node_output.get("status") == "generated":
+                                sp_list = node_output.get("sp_list", [])
+                                assistant_response = f"已生成 {len(sp_list)} 个存储过程。\n"
+                                for sp in sp_list:
+                                    assistant_response += f"- {sp['name']}\n"
+                                assistant_response += "\n正在校验..."
 
-                        yield f"data: {json.dumps({'node': node_name, 'data': node_output, 'type': 'update'})}\n\n"
+                            elif node_output.get("status") in ("verified", "verify_failed"):
+                                # generate 已失败时跳过 verify 结果
+                                if generate_failed:
+                                    yield f"data: {json.dumps({'node': node_name, 'data': node_output, 'type': 'update'})}\n\n"
+                                    continue
+                                v_results = node_output.get("verify_results", [])
+                                print(f"[DEBUG verify_result] status={node_output.get('status')}, v_results count={len(v_results)}", flush=True)
+                                for i, vr in enumerate(v_results):
+                                    print(f"[DEBUG verify_result]   [{i}] sp_id={vr.get('sp_id','?')[:8]}, syntax_ok={vr.get('syntax_ok')}, biz_ok={vr.get('business_ok')}, details={len(vr.get('details',[]))}", flush=True)
+                                lines = ["\n--- 校验结果 ---"]
+                                if v_results:
+                                    for vr in v_results:
+                                        sp_name = vr.get("sp_name", vr.get("sp_id", "")[:8])
+                                        syn = "✅" if vr.get("syntax_ok") else "❌"
+                                        biz = "✅" if vr.get("business_ok") else "❌"
+                                        lines.append(f"📄 {sp_name}")
+                                        lines.append(f"   {syn} 语法  {biz} 业务")
+                                        for d in vr.get("details", []):
+                                            if d.get("type") == "syntax" and not d.get("pass"):
+                                                lines.append(f"   语法错误: {d.get('error', '')[:120]}")
+                                            elif d.get("type") == "business":
+                                                mark = "✅" if d.get("pass") else "❌"
+                                                detail = d.get('data', d.get('error', ''))
+                                                detail_str = str(detail)[:120] if detail else ''
+                                                lines.append(f"   {mark} {d.get('query', '')}: {detail_str}")
+                                else:
+                                    lines.append("⚠️ 校验结果为空，可能未生成存储过程")
+                                assistant_response = "\n".join(lines)
+                                yield f"data: {json.dumps({'type': 'verify_result', 'content': assistant_response, 'data': node_output})}\n\n"
 
-            # 流结束后检查是否产生了新的中断
-            new_state = graph.get_state(config)
-            if _has_interrupt(new_state):
+                            yield f"data: {json.dumps({'node': node_name, 'data': node_output, 'type': 'update'})}\n\n"
+
+            # 主事件流
+            for _item in _handle_event():
+                yield _item
+
+            # 自动修复 / 中断循环
+            while True:
+                new_state = graph.get_state(config)
+                if not new_state or not _has_interrupt(new_state):
+                    break
+
                 interrupt_val = _get_interrupt_value(new_state)
-                if isinstance(interrupt_val, dict):
-                    itype = interrupt_val.get("type", "")
-                    if itype == "clarify":
-                        q_num = interrupt_val.get("q_num", "")
-                        prefix = f"Q{q_num}：" if q_num else ""
-                        assistant_response = prefix + interrupt_val.get("question", "")
-                        yield f"data: {json.dumps({'type': 'question', 'content': assistant_response})}\n\n"
-                    elif itype == "design":
-                        assistant_response = interrupt_val.get("content", "")
-                        yield f"data: {json.dumps({'type': 'design', 'content': assistant_response})}\n\n"
+                if not isinstance(interrupt_val, dict):
+                    break
+
+                itype = interrupt_val.get("type", "")
+
+                if itype == "auto_fix_progress":
+                    # 发送修复进度消息，然后自动恢复 graph
+                    msg = interrupt_val.get("message", "")
+                    yield f"data: {json.dumps({'type': 'auto_fix_progress', 'content': msg})}\n\n"
+                    try:
+                        events = graph.stream(Command(resume="continue"), config)
+                        for _item in _handle_event():
+                            yield _item
+                        continue  # 回到 while 开头检查是否有新中断
+                    except Exception as e:
+                        error_msg = f"自动修复过程出错: {str(e)}"
+                        yield f"data: {json.dumps({'type': 'error', 'content': error_msg})}\n\n"
+                        break
+
+                elif itype == "clarify":
+                    q_num = interrupt_val.get("q_num", "")
+                    prefix = f"Q{q_num}：" if q_num else ""
+                    assistant_response = prefix + interrupt_val.get("question", "")
+                    yield f"data: {json.dumps({'type': 'question', 'content': assistant_response})}\n\n"
+                    break  # 等待用户输入
+
+                elif itype == "design":
+                    content = interrupt_val.get("content", "")
+                    reply = interrupt_val.get("reply", "")
+                    if reply:
+                        assistant_response = reply + "\n\n" + content
+                    else:
+                        assistant_response = content
+                    yield f"data: {json.dumps({'type': 'design', 'content': assistant_response})}\n\n"
+                    break  # 等待用户输入
+
+                else:
+                    break  # 未知中断类型
 
             if not assistant_response:
                 assistant_response = "处理完成"

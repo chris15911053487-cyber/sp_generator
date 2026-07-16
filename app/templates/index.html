@@ -230,6 +230,9 @@
                     } else if (data.type === 'design') {
                         assistantText = data.content;
                         assistantDiv.innerHTML = '<strong>📋 设计方案：</strong><br><pre style="white-space:pre-wrap;font-size:13px;margin-top:4px;">' + escapeHtml(data.content) + '</pre>';
+                    } else if (data.type === 'auto_fix_progress') {
+                        assistantText = data.content;
+                        assistantDiv.innerHTML = '<em style="color:#e67e22;">⏳ ' + escapeHtml(data.content) + '</em>';
                     } else if (data.type === 'verify_result') {
                         assistantText = data.content;
                         // 渲染校验结果到聊天区（改回 assistant 样式，避免被前一个 error 事件设为 message error 后白字）

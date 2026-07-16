@@ -16,6 +16,13 @@ def _after_clarify(state: AgentState) -> str:
     return "clarify"
 
 
+def _after_design(state: AgentState) -> str:
+    """设计阶段后续路由：用户确认 → 进入生成；用户反馈 → 回到设计。"""
+    if state.get("mode") == "design":
+        return "plan"
+    return "generate"
+
+
 def create_graph() -> StateGraph:
     builder = StateGraph(AgentState)
 
@@ -32,7 +39,10 @@ def create_graph() -> StateGraph:
         "clarify": "clarify",
         "plan": "plan",
     })
-    builder.add_edge("plan", "generate")
+    builder.add_conditional_edges("plan", _after_design, {
+        "plan": "plan",
+        "generate": "generate",
+    })
     builder.add_edge("generate", "verify")
     builder.add_edge("verify", END)
     builder.add_edge("deploy_check", "deploy")

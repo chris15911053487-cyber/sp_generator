@@ -13,6 +13,9 @@ def _get_conn() -> sqlite3.Connection:
 
 def init_db() -> None:
     conn = _get_conn()
+    # WAL 模式 + busy_timeout：支持多线程并发写入不报 database is locked
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS sessions (
             id TEXT PRIMARY KEY,
