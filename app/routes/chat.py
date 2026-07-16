@@ -75,9 +75,9 @@ async def api_chat_stream(req: ChatRequest):
                         "design_phase": state.values.get("design_phase") if state.values else None,
                         "last_feedback_reply": state.values.get("last_feedback_reply", "") if state.values else "",
                     }
-                    events = graph.stream(new_input, config)
+                    events = graph.astream(new_input, config, stream_mode=["updates", "custom"])
                 else:
-                    events = graph.stream(Command(resume=req.message), config)
+                    events = graph.astream(Command(resume=req.message), config, stream_mode=["updates", "custom"])
             elif state and state.values:
                 # 继续既有会话
                 mode = state.values.get("mode", "clarify")
@@ -98,7 +98,7 @@ async def api_chat_stream(req: ChatRequest):
                     "design_phase": state.values.get("design_phase"),
                     "last_feedback_reply": state.values.get("last_feedback_reply", ""),
                 }
-                events = graph.stream(input_state, config)
+                events = graph.astream(input_state, config, stream_mode=["updates", "custom"])
             else:
                 # 全新会话
                 input_state = {
@@ -115,19 +115,25 @@ async def api_chat_stream(req: ChatRequest):
                     "design_phase": None,
                     "last_feedback_reply": "",
                 }
-                events = graph.stream(input_state, config)
+                events = graph.astream(input_state, config, stream_mode=["updates", "custom"])
 
             assistant_response = ""
             generate_failed = False  # generate 失败时不再用 verify 结果覆盖，避免"校验全对但右侧旧SP"误导
 
-            def _handle_event():
+            async def _handle_event():
                 """处理单个事件流，返回是否需要继续处理后续中断（auto_fix 场景）。
                 注意：用 nonlocal 修改外层 assistant_response 和 generate_failed。
                 """
                 nonlocal assistant_response, generate_failed
 
-                for event in events:
-                    for node_name, node_output in event.items():
+                async for mode, data in events:
+                    if mode == "custom":
+                        # 流式 token 事件：直接转发给前端
+                        yield f"data: {json.dumps(data)}\n\n"
+                        continue
+
+                    # mode == "updates": 节点完成事件，保持原有逻辑
+                    for node_name, node_output in data.items():
                         if isinstance(node_output, dict):
                             if node_output.get("error"):
                                 # generate 等节点出错（如 LLM 响应解析失败）
@@ -178,7 +184,7 @@ async def api_chat_stream(req: ChatRequest):
                             yield f"data: {json.dumps({'node': node_name, 'data': node_output, 'type': 'update'})}\n\n"
 
             # 主事件流
-            for _item in _handle_event():
+            async for _item in _handle_event():
                 yield _item
 
             # 自动修复 / 中断循环
@@ -198,8 +204,8 @@ async def api_chat_stream(req: ChatRequest):
                     msg = interrupt_val.get("message", "")
                     yield f"data: {json.dumps({'type': 'auto_fix_progress', 'content': msg})}\n\n"
                     try:
-                        events = graph.stream(Command(resume="continue"), config)
-                        for _item in _handle_event():
+                        events = graph.astream(Command(resume="continue"), config, stream_mode=["updates", "custom"])
+                        async for _item in _handle_event():
                             yield _item
                         continue  # 回到 while 开头检查是否有新中断
                     except Exception as e:

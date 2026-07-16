@@ -41,6 +41,7 @@ def _get_llm() -> ChatOpenAI:
         base_url=cfg["base_url"],
         model=cfg["model_name"],
         temperature=0.1,
+        streaming=True,
     )
 
 
@@ -67,19 +68,42 @@ def _parse_dsml_tool_calls(content: str) -> list[tuple[str, dict]]:
     return calls
 
 
-def _invoke_with_tools(llm: ChatOpenAI, messages: list, max_rounds: int = 8) -> AIMessage:
+def _invoke_with_tools(llm: ChatOpenAI, messages: list, max_rounds: int = 8,
+                       stream_writer=None) -> AIMessage:
     """调用 LLM 并自动处理 tool calling 循环，直到 LLM 不再调 tool 为止。
 
     兼容两种工具调用格式：
     - 标准 OpenAI function calling（response.tool_calls）
     - DeepSeek 间歇性输出的 DSML 文本格式（LangChain 不识别，需手动解析执行）
+
+    stream_writer: 可选的 Callable，传入时使用 stream() 逐 token 获取，
+    最终响应（无工具调用）的 tokens 通过 stream_writer 逐个发送。
+    未传入时行为与原来完全一致（invoke）。
     """
     tools = create_tools()
     tool_map = {t.name: t for t in tools}
     llm_with_tools = llm.bind_tools(tools)
 
     for _ in range(max_rounds):
-        response = llm_with_tools.invoke(messages)
+        if stream_writer is not None:
+            # 流式模式：用 stream() 逐 chunk 获取，有内容立即推送给前端
+            full = None
+            tokens = []
+            for chunk in llm_with_tools.stream(messages):
+                if full is None:
+                    full = chunk
+                else:
+                    full += chunk
+                if chunk.content:
+                    tokens.append(chunk.content)
+                    # 立即推送每个 token，实现逐字流式效果
+                    stream_writer({"type": "token", "content": chunk.content})
+            if full is None:
+                break
+            response = full
+        else:
+            # 非流式模式：保持原有行为
+            response = llm_with_tools.invoke(messages)
 
         # 1) 标准工具调用：append AIMessage + ToolMessage
         if response.tool_calls:
@@ -99,7 +123,7 @@ def _invoke_with_tools(llm: ChatOpenAI, messages: list, max_rounds: int = 8) -> 
         # 2) DSML 非标准工具调用：解析执行，结果作为 HumanMessage 追加
         #    （不 append 含 DSML 的 AIMessage，避免 tool_call_id 配对报错）
         content = response.content or ""
-        dsml_calls = _parse_dsml_tool_calls(content) if "<｜｜DSML｜｜" in content else []
+        dsml_calls = _parse_dsml_tool_calls(content) if "<zm" in content else []
         if dsml_calls:
             result_parts = []
             for name, args in dsml_calls:
@@ -115,7 +139,7 @@ def _invoke_with_tools(llm: ChatOpenAI, messages: list, max_rounds: int = 8) -> 
             messages.append(HumanMessage(content="\n\n".join(result_parts)))
             continue
 
-        # 3) 无工具调用：最终响应
+        # 3) 无工具调用：最终响应（token 已在上面逐 chunk 推送，无需额外 flush）
         return response
 
     # 循环耗尽：LLM 仍想调工具时，强提示直接输出 JSON，避免 plain invoke 仍返回 DSML/空
@@ -123,7 +147,6 @@ def _invoke_with_tools(llm: ChatOpenAI, messages: list, max_rounds: int = 8) -> 
         content="工具调用已达上限。请基于已获取的信息，直接输出最终的 JSON 响应，不要再调用任何工具。"
     ))
     return llm.invoke(messages)
-
 
 def _build_chat_history(session_id: str, max_msgs: int = 10) -> str:
     msgs = get_messages(session_id)
@@ -172,6 +195,7 @@ def _classify_design_feedback(llm: ChatOpenAI, design: str, feedback: str) -> tu
 def clarify_node(state: AgentState, config: dict = None) -> dict:
     """需求澄清节点 — 系统控制编号，最多 5 个问题，可提前结束。"""
     llm = _get_llm()
+    stream_writer = config.get("configurable", {}).get("__pregel_stream_writer") if config else None
     chat_history = _build_chat_history(state["session_id"])
     clarified = state.get("requirements", "")
     clarify_count = state.get("clarify_count", 0) or 0
@@ -211,7 +235,7 @@ def clarify_node(state: AgentState, config: dict = None) -> dict:
         last_question_hint=last_question_hint,
     )
     messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=prompt)]
-    response = _invoke_with_tools(llm, messages, max_rounds=1)
+    response = _invoke_with_tools(llm, messages, max_rounds=1, stream_writer=stream_writer)
 
     if "INFO_SUFFICIENT" in response.content:
         return {
@@ -242,6 +266,7 @@ def clarify_node(state: AgentState, config: dict = None) -> dict:
 def design_node(state: AgentState, config: dict = None) -> dict:
     """方案设计节点 — 基于需求生成方案，支持多轮反馈确认。"""
     llm = _get_llm()
+    stream_writer = config.get("configurable", {}).get("__pregel_stream_writer") if config else None
     design_phase = state.get("design_phase")
     design = state.get("design", "")
 
@@ -308,7 +333,7 @@ def design_node(state: AgentState, config: dict = None) -> dict:
     if not design:
         prompt = DESIGN_PROMPT.format(requirements=state["requirements"])
         messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=prompt)]
-        response = _invoke_with_tools(llm, messages, max_rounds=3)
+        response = _invoke_with_tools(llm, messages, max_rounds=3, stream_writer=stream_writer)
         design = response.content
 
     decision = interrupt({"type": "design", "content": design, "phase": "new"})
