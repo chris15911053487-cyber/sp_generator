@@ -129,6 +129,8 @@ def substitute_params(sql: str, params: dict) -> str:
         key = m.group(1)
         if key in params:
             val = params[key]
+            if val is None or val == '':
+                return 'NULL'
             if isinstance(val, str):
                 escaped = val.replace("'", "''")
                 return f"'{escaped}'"

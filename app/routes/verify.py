@@ -42,7 +42,7 @@ def api_check_business(sp_id: str, req: VerifySpRequest = None):
         if row and row["parameters"]:
             try:
                 param_list = json.loads(row["parameters"])
-                params = {p["name"]: p.get("default", "") for p in param_list if p.get("default")}
+                params = {p["name"]: p.get("default", "") for p in param_list if "default" in p}
             except (json.JSONDecodeError, KeyError):
                 pass
 
@@ -101,7 +101,7 @@ def api_verify_single_sp(sp_id: str, req: VerifySpRequest = None):
     if not params and sp.get("parameters"):
         try:
             param_list = json.loads(sp["parameters"])
-            params = {p["name"]: p.get("default", "") for p in param_list if p.get("default")}
+            params = {p["name"]: p.get("default", "") for p in param_list if "default" in p}
         except (json.JSONDecodeError, KeyError):
             params = {}
 
@@ -176,7 +176,7 @@ def api_verify_all(session_id: str):
         params = {}
         try:
             param_list = json.loads(sp.get("parameters", "[]"))
-            params = {p["name"]: p.get("default", "") for p in param_list if p.get("default")}
+            params = {p["name"]: p.get("default", "") for p in param_list if "default" in p}
         except (json.JSONDecodeError, KeyError, TypeError):
             pass
 
