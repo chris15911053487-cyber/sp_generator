@@ -2,7 +2,7 @@
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 from app.agent.nodes import (
-    AgentState, clarify_node, design_node, generate_node,
+    AgentState, clarify_node, assumptions_node, design_node, generate_node,
     verify_node, deploy_check_node, deploy_node,
 )
 
@@ -11,9 +11,22 @@ _memory = MemorySaver()
 
 
 def _after_clarify(state: AgentState) -> str:
+    if state.get("mode") == "assumptions":
+        return "assumptions"
+    if state.get("mode") == "design":
+        return "assumptions"
+    if state.get("mode") == "generate":
+        return "generate"
+    return "clarify"
+
+
+def _after_assumptions(state: AgentState) -> str:
+    """关键项确认后路由：进入设计阶段。"""
     if state.get("mode") == "design":
         return "plan"
-    return "clarify"
+    if state.get("mode") == "generate":
+        return "generate"
+    return "assumptions"
 
 
 def _after_design(state: AgentState) -> str:
@@ -27,6 +40,7 @@ def create_graph() -> StateGraph:
     builder = StateGraph(AgentState)
 
     builder.add_node("clarify", clarify_node)
+    builder.add_node("assumptions", assumptions_node)
     builder.add_node("plan", design_node)
     builder.add_node("generate", generate_node)
     builder.add_node("verify", verify_node)
@@ -37,7 +51,13 @@ def create_graph() -> StateGraph:
 
     builder.add_conditional_edges("clarify", _after_clarify, {
         "clarify": "clarify",
+        "assumptions": "assumptions",
+        "generate": "generate",
+    })
+    builder.add_conditional_edges("assumptions", _after_assumptions, {
+        "assumptions": "assumptions",
         "plan": "plan",
+        "generate": "generate",
     })
     builder.add_conditional_edges("plan", _after_design, {
         "plan": "plan",

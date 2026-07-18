@@ -1,9 +1,12 @@
-"""校验管理 API — 语法校验、业务校验。"""
+"""校验管理 API — 语法校验、业务校验（含数据对比）。"""
 import json
 from fastapi import APIRouter
 from pydantic import BaseModel
 from app.db.sqlite import get_sps, get_verify_queries, update_sp, update_verify_query
-from app.db.sqlserver import check_syntax, execute_query, substitute_params
+from app.db.sqlserver import (
+    check_syntax, execute_query, substitute_params,
+    execute_sp_with_params, compare_sp_results,
+)
 
 router = APIRouter(prefix="/api/verify", tags=["verify"])
 
@@ -32,7 +35,7 @@ def api_check_syntax(session_id: str, sp_id: str):
 
 @router.post("/business/{sp_id}")
 def api_check_business(sp_id: str, req: VerifySpRequest = None):
-    """对单个 SP 执行所有关联校验 SQL 的业务校验。"""
+    """对单个 SP 执行所有关联校验 SQL 的业务校验（含数据对比）。"""
     from app.db.sqlite import _get_conn as _get_db
     params = req.params if req and req.params else {}
     if not params:
@@ -46,14 +49,61 @@ def api_check_business(sp_id: str, req: VerifySpRequest = None):
             except (json.JSONDecodeError, KeyError):
                 pass
 
+    # 获取 SP 信息用于执行对比
+    conn = _get_db()
+    sp_row = conn.execute("SELECT name, status, parameters FROM stored_procedures WHERE id = ?", (sp_id,)).fetchone()
+    conn.close()
+    sp_name = sp_row["name"] if sp_row else ""
+    sp_deployed = sp_row and sp_row["status"] == "deployed"
+    param_defs = []
+    if sp_row and sp_row["parameters"]:
+        try:
+            param_defs = json.loads(sp_row["parameters"])
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # 执行 SP 获取结果（只有已部署才能执行）
+    sp_rows = None
+    sp_exec_error = None
+    if sp_deployed:
+        try:
+            sp_rows = execute_sp_with_params(sp_name, params, param_defs)
+        except Exception as e:
+            sp_exec_error = str(e)
+
     vqs = get_verify_queries(sp_id)
     results = []
     for vq in vqs:
         try:
             sql_to_run = substitute_params(vq["sql_code"], params)
-            rows = execute_query(sql_to_run)
-            update_verify_query(vq["id"], status="pass", result_detail=json.dumps(rows[:20], ensure_ascii=False, indent=2))
-            results.append({"query_id": vq["id"], "name": vq["name"], "pass": True, "data": rows[:10]})
+            verify_rows = execute_query(sql_to_run)
+
+            # 数据对比
+            compare_columns = vq.get("compare_columns", "")
+            comparison = None
+            if sp_rows is not None and compare_columns:
+                comparison = compare_sp_results(sp_rows, verify_rows, compare_columns)
+                is_pass = comparison["match"]
+            elif sp_exec_error:
+                is_pass = True  # SP 执行失败不影响校验 SQL 本身的 pass
+                comparison = {"match": None, "summary": f"⚠️ SP 执行失败，无法对比: {sp_exec_error}"}
+            elif not sp_deployed:
+                is_pass = True  # SP 未部署，只检查校验 SQL 能否执行
+                comparison = {"match": None, "summary": "⚠️ SP 未部署，仅验证校验 SQL 可执行"}
+            else:
+                is_pass = True  # 无对比列，只验证能跑通
+
+            result_detail = {
+                "rows": verify_rows[:20],
+                "comparison": comparison,
+            }
+            status = "pass" if is_pass else "fail"
+            update_verify_query(vq["id"], status=status,
+                                result_detail=json.dumps(result_detail, ensure_ascii=False, indent=2))
+            results.append({
+                "query_id": vq["id"], "name": vq["name"], "pass": is_pass,
+                "data": verify_rows[:10], "comparison": comparison,
+            })
         except Exception as e:
             update_verify_query(vq["id"], status="fail", result_detail=str(e))
             results.append({"query_id": vq["id"], "name": vq["name"], "pass": False, "error": str(e)})
@@ -120,16 +170,59 @@ def api_verify_single_sp(sp_id: str, req: VerifySpRequest = None):
     syntax_ok, syntax_err = check_syntax(code)
     update_sp(sp_id, syntax_valid=1 if syntax_ok else 0)
 
-    # 业务校验
+    # 执行 SP 获取结果集（只有已部署才能执行）
+    sp_deployed = sp.get("status") == "deployed"
+    sp_rows = None
+    sp_exec_error = None
+    param_defs = []
+    try:
+        param_defs = json.loads(sp.get("parameters", "[]"))
+    except (json.JSONDecodeError, TypeError):
+        pass
+    if sp_deployed:
+        try:
+            sp_rows = execute_sp_with_params(sp["name"], params, param_defs)
+        except Exception as e:
+            sp_exec_error = str(e)
+
+    # 业务校验（含数据对比）
     vqs = get_verify_queries(sp_id)
     biz_results = []
     biz_all_ok = True
     for vq in vqs:
         try:
             sql_to_run = substitute_params(vq["sql_code"], params)
-            rows = execute_query(sql_to_run)
-            update_verify_query(vq["id"], status="pass", result_detail=json.dumps(rows[:20], ensure_ascii=False, indent=2))
-            biz_results.append({"query_id": vq["id"], "name": vq["name"], "pass": True, "data": rows[:10]})
+            verify_rows = execute_query(sql_to_run)
+
+            # 数据对比
+            compare_columns = vq.get("compare_columns", "")
+            comparison = None
+            if sp_rows is not None and compare_columns:
+                comparison = compare_sp_results(sp_rows, verify_rows, compare_columns)
+                is_pass = comparison["match"]
+            elif sp_exec_error:
+                is_pass = True  # SP 执行失败不影响校验 SQL 本身的 pass
+                comparison = {"match": None, "summary": f"⚠️ SP 执行失败，无法对比: {sp_exec_error}"}
+            elif not sp_deployed:
+                is_pass = True  # SP 未部署，只检查校验 SQL 能否执行
+                comparison = {"match": None, "summary": "⚠️ SP 未部署，仅验证校验 SQL 可执行"}
+            else:
+                is_pass = True  # 无对比列，只验证能跑通
+
+            if not is_pass:
+                biz_all_ok = False
+
+            result_detail = {
+                "rows": verify_rows[:20],
+                "comparison": comparison,
+            }
+            status = "pass" if is_pass else "fail"
+            update_verify_query(vq["id"], status=status,
+                                result_detail=json.dumps(result_detail, ensure_ascii=False, indent=2))
+            biz_results.append({
+                "query_id": vq["id"], "name": vq["name"], "pass": is_pass,
+                "data": verify_rows[:10], "comparison": comparison,
+            })
         except Exception as e:
             biz_all_ok = False
             update_verify_query(vq["id"], status="fail", result_detail=str(e))
@@ -156,6 +249,7 @@ def api_verify_single_sp(sp_id: str, req: VerifySpRequest = None):
             "query_id": br.get("query_id"),
             "data": br.get("data"),
             "error": br.get("error"),
+            "comparison": br.get("comparison"),
         })
     update_sp(sp_id, status=sp_status, verify_result=str(sp_result))
 

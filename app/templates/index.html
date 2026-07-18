@@ -18,6 +18,7 @@
             <button onclick="createSession()">➕ 新建</button>
             <button onclick="deleteCurrentSession()">🗑️ 删除</button>
             <a href="/config" id="settings-link">⚙️ 设置</a>
+            <a href="/help" target="_blank" id="help-link">📖 帮助</a>
         </nav>
         <div id="status-bar">
             <span id="db-status">🔍 检测中...</span>
@@ -29,10 +30,15 @@
         <section id="chat-panel">
             <div id="chat-messages"></div>
             <form id="chat-form" onsubmit="sendMessage(event)">
-                <textarea id="chat-input" name="message" placeholder="描述你的存储过程需求..." rows="2"></textarea>
-                <button type="submit">发送</button>
+                <textarea id="chat-input" name="message" placeholder="描述你的存储过程需求...（Enter 发送，Shift+Enter 换行）" rows="2"></textarea>
+                <div class="chat-form-actions">
+                    <button type="submit" id="btn-send">发送</button>
+                    <button type="button" id="btn-stop" onclick="stopGeneration()" style="display:none;">⏹ 停止</button>
+                </div>
             </form>
         </section>
+
+        <div id="panel-resizer"></div>
 
         <section id="right-panel">
             <h2>存储过程 <button id="btn-refresh-sp" onclick="loadSpList()" style="float:right;font-size:11px;padding:2px 8px;">🔄 刷新</button></h2>
@@ -64,9 +70,225 @@
         }
     }
 
+    function renderDesignContent(text) {
+        if (!text) return '';
+
+        // 尝试检测 JSON 格式的设计方案（LLM 有时直接输出 JSON）
+        const jsonDesign = _tryParseDesignJson(text);
+        if (jsonDesign) return jsonDesign;
+
+        // 尝试匹配严格格式（带 HTML 注释标记）
+        let verifyMatch = text.match(/<!--\s*VERIFY_LOGIC_START\s*-->([\s\S]*?)<!--\s*VERIFY_LOGIC_END\s*-->/);
+        let before, after, verifyBlock;
+
+        if (verifyMatch) {
+            before = text.slice(0, verifyMatch.index);
+            after = text.slice(verifyMatch.index + verifyMatch[0].length);
+            verifyBlock = verifyMatch[1].trim();
+        } else {
+            // 宽松匹配：找到"校验逻辑"标题行，取后续内容直到下一个 ## 标题或文末
+            const titleMatch = text.match(/^[#*\s\d.]*校验逻辑(?:描述)?[^\n]*/m);
+            if (!titleMatch) return renderMarkdown(text);
+            const titleStart = text.indexOf(titleMatch[0]);
+            const titleEnd = text.indexOf('\n', titleStart);
+            if (titleEnd === -1) return renderMarkdown(text);
+            const contentAfter = text.slice(titleEnd + 1);
+            // 找下一个 ## 标题作为结束
+            const nextSection = contentAfter.search(/\n##\s/);
+            verifyBlock = (nextSection !== -1) ? contentAfter.slice(0, nextSection).trim() : contentAfter.trim();
+            if (!/SP名称|sp名称/i.test(verifyBlock)) return renderMarkdown(text);
+            before = text.slice(0, titleStart);
+            after = (nextSection !== -1) ? contentAfter.slice(nextSection) : '';
+        }
+
+        // 解析校验逻辑块（兼容有无 "- " 前缀）
+        let verifyHtml = '<div class="verify-logic-block"><div class="verify-logic-header">🔍 校验逻辑</div>';
+        let currentSp = null;
+        let rows = [];
+
+        for (const line of verifyBlock.split('\n')) {
+            const trimmed = line.trim();
+            if (!trimmed) continue;
+            // 匹配 SP 名称行：兼容 "- SP名称: xxx" 和 "SP名称: xxx"
+            const spMatch = trimmed.match(/^(?:-\s*)?SP名称[:：]\s*(.+)$/i);
+            if (spMatch) {
+                if (currentSp && rows.length) {
+                    verifyHtml += renderVerifyTable(currentSp, rows);
+                    rows = [];
+                }
+                currentSp = spMatch[1].trim();
+                continue;
+            }
+            // 匹配校验项行：兼容 "- 校验N: ..." 和 "校验N: ..."
+            const vqMatch = trimmed.match(/^(?:-\s*)?校验(\d+)[:：]\s*(.+)$/);
+            if (vqMatch && currentSp) {
+                const parts = vqMatch[2].split('|').map(p => p.trim());
+                rows.push({
+                    num: vqMatch[1],
+                    name: parts[0] || '',
+                    desc: parts[1] || '',
+                    columns: parts[2] || ''
+                });
+            }
+        }
+        if (currentSp && rows.length) {
+            verifyHtml += renderVerifyTable(currentSp, rows);
+        }
+        verifyHtml += '</div>';
+
+        return renderMarkdown(before) + verifyHtml + renderMarkdown(after);
+    }
+
+    function renderVerifyTable(spName, rows) {
+        let html = '<div class="verify-sp-section"><div class="verify-sp-name">📦 ' + escapeHtml(spName) + '</div>';
+        html += '<table class="verify-table"><thead><tr><th>#</th><th>校验名称</th><th>校验方式</th><th>对比列</th></tr></thead><tbody>';
+        for (const r of rows) {
+            html += '<tr><td>' + escapeHtml(r.num) + '</td><td>' + escapeHtml(r.name) + '</td><td>' + escapeHtml(r.desc) + '</td><td><code>' + escapeHtml(r.columns) + '</code></td></tr>';
+        }
+        html += '</tbody></table></div>';
+        return html;
+    }
+
+    function _tryParseDesignJson(text) {
+        // 尝试从文本中提取 JSON 格式的设计方案
+        // 支持：纯 JSON 内容、或前缀文本 + JSON
+        let jsonStr = text.trim();
+        // 如果内容以 { 开头，尝试直接解析
+        let obj = null;
+        if (jsonStr.startsWith('{')) {
+            try { obj = JSON.parse(jsonStr); } catch(e) {}
+        }
+        // 如果整段不是 JSON，尝试找到第一个 { 开始的部分
+        if (!obj) {
+            const idx = text.indexOf('{');
+            if (idx > 0) {
+                try { obj = JSON.parse(text.slice(idx)); } catch(e) {}
+            }
+        }
+        if (!obj) return null;
+
+        // 检查是否包含设计方案字段
+        const spList = obj['存储过程列表'] || obj['procedures'] || obj['sp_list'];
+        if (!spList || !Array.isArray(spList)) return null;
+
+        let html = '';
+        // 渲染前缀文本（如果有）
+        const prefixIdx = text.indexOf('{');
+        if (prefixIdx > 0) {
+            const prefix = text.slice(0, prefixIdx).trim();
+            if (prefix) html += renderMarkdown(prefix);
+        }
+
+        // 渲染存储过程列表
+        html += '<div class="design-sp-list"><strong>存储过程列表：</strong>';
+        for (const sp of spList) {
+            const name = sp['名称'] || sp['name'] || '未命名';
+            const purpose = sp['用途'] || sp['purpose'] || '';
+            const params = sp['参数定义'] || sp['parameters'] || '';
+            const logic = sp['业务逻辑描述'] || sp['业务逻辑'] || sp['logic'] || '';
+            html += `<div class="design-sp-item" style="margin:8px 0;padding:8px 12px;background:#f8f9fc;border-radius:6px;border-left:3px solid #6c5ce7;">`;
+            html += `<div><strong>📦 ${escapeHtml(name)}</strong>`;
+            if (purpose) html += ` — ${escapeHtml(purpose)}`;
+            html += `</div>`;
+            if (params) {
+                const paramStr = Array.isArray(params) ? params.map(p => typeof p === 'string' ? p : `${p['名称']||p['name']||''} ${p['类型']||p['type']||''}`).join(', ') : String(params);
+                html += `<div style="margin-top:4px;font-size:13px;color:#636e72;">参数: ${escapeHtml(paramStr)}</div>`;
+            }
+            if (logic) html += `<div style="margin-top:4px;font-size:13px;color:#2d3436;">${escapeHtml(String(logic))}</div>`;
+            html += `</div>`;
+        }
+        html += '</div>';
+
+        // 渲染校验逻辑（如果有）
+        const verifyLogic = obj['校验逻辑'] || obj['校验逻辑描述'] || obj['verify_logic'];
+        if (verifyLogic) {
+            html += '<div style="margin-top:12px;"><strong>🔍 校验逻辑：</strong></div>';
+            if (typeof verifyLogic === 'string') {
+                html += renderMarkdown(verifyLogic);
+            } else {
+                html += `<pre style="background:#2d3436;color:#dfe6e9;padding:12px;border-radius:6px;overflow-x:auto;font-size:13px;">${escapeHtml(JSON.stringify(verifyLogic, null, 2))}</pre>`;
+            }
+        }
+
+        // 渲染注意事项（如果有）
+        const notes = obj['注意事项'] || obj['notes'];
+        if (notes) {
+            html += '<div style="margin-top:12px;"><strong>⚠️ 注意事项：</strong></div>';
+            html += renderMarkdown(typeof notes === 'string' ? notes : JSON.stringify(notes));
+        }
+
+        return html;
+    }
+
     let currentSessionId = '';
     let cmInstances = {};  // 缓存 CodeMirror 实例
     let lastVerifyResults = {};  // 缓存最近一次校验结果 {sp_id: result}
+    let currentReader = null;  // 当前流式读取器，用于停止生成
+    let isGenerating = false;  // 是否正在生成
+
+    // Enter 发送，Shift+Enter 换行
+    document.addEventListener('DOMContentLoaded', function() {
+        const chatInput = document.getElementById('chat-input');
+        chatInput.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                if (!isGenerating) {
+                    document.getElementById('chat-form').dispatchEvent(new Event('submit', {cancelable: true}));
+                }
+            }
+        });
+
+        // 面板拖拽分割
+        const resizer = document.getElementById('panel-resizer');
+        const chatPanel = document.getElementById('chat-panel');
+        const rightPanel = document.getElementById('right-panel');
+        const mainEl = document.querySelector('main');
+        let isResizing = false;
+
+        resizer.addEventListener('mousedown', function(e) {
+            isResizing = true;
+            document.body.style.cursor = 'col-resize';
+            document.body.style.userSelect = 'none';
+            e.preventDefault();
+        });
+
+        document.addEventListener('mousemove', function(e) {
+            if (!isResizing) return;
+            const mainRect = mainEl.getBoundingClientRect();
+            const offsetX = e.clientX - mainRect.left;
+            const totalWidth = mainRect.width;
+            let percent = (offsetX / totalWidth) * 100;
+            // 限制范围 25% ~ 75%
+            percent = Math.max(25, Math.min(75, percent));
+            chatPanel.style.flex = `0 0 ${percent}%`;
+            chatPanel.style.width = `${percent}%`;
+            rightPanel.style.flex = `0 0 ${100 - percent}%`;
+            rightPanel.style.width = `${100 - percent}%`;
+        });
+
+        document.addEventListener('mouseup', function() {
+            if (isResizing) {
+                isResizing = false;
+                document.body.style.cursor = '';
+                document.body.style.userSelect = '';
+            }
+        });
+    });
+
+    function setGeneratingState(generating) {
+        isGenerating = generating;
+        document.getElementById('btn-send').style.display = generating ? 'none' : '';
+        document.getElementById('btn-stop').style.display = generating ? '' : 'none';
+        document.getElementById('chat-input').disabled = generating;
+    }
+
+    function stopGeneration() {
+        if (currentReader) {
+            currentReader.cancel();
+            currentReader = null;
+        }
+        setGeneratingState(false);
+    }
 
     // ====== 会话管理 ======
 
@@ -171,12 +393,79 @@
         if (html) {
             div.innerHTML = html;
         } else if (role === 'assistant') {
-            div.innerHTML = renderMarkdown(content);
+            // 先清理内容（如 Q 问题后面跟的无关 JSON）
+            const cleaned = _cleanAssistantContent(content);
+            // 检测是否为设计方案（包含校验逻辑块或存储过程设计 JSON）
+            if (cleaned && _isDesignContent(cleaned)) {
+                div.innerHTML = '<div class="design-block"><div class="design-header">📋 设计方案</div><div class="design-content">' + renderDesignContent(cleaned) + '</div></div>';
+            } else {
+                div.innerHTML = renderMarkdown(cleaned);
+            }
         } else {
-            div.textContent = content;
+            // user 消息：检测是否为系统操作性 JSON，显示友好文本
+            const friendly = _userMessageFriendly(content);
+            div.textContent = friendly;
+        }
+        // 为 assistant 和 user 消息添加复制按钮
+        if (role === 'assistant' || role === 'user') {
+            div.setAttribute('data-raw-content', content || '');
+            addCopyButton(div);
         }
         container.appendChild(div);
         container.scrollTop = container.scrollHeight;
+    }
+
+    function _cleanAssistantContent(content) {
+        if (!content) return content;
+        // 检测模式：Q数字：或 Q数字: 开头，后面跟着大段 JSON
+        // 例如 "Q3：json { "stored_procedure": ... }"
+        // 这种是 LLM 不规范输出，只保留问题部分
+        const qMatch = content.match(/^(Q\d+[：:]\s*)([\s\S]*)$/);
+        if (qMatch) {
+            const afterQ = qMatch[2];
+            // 如果问题后面紧跟 json 或 { 开头的大段 JSON 内容（>200字符），截断
+            const jsonStart = afterQ.match(/^(json\s*)?\{/i);
+            if (jsonStart && afterQ.length > 200) {
+                // 尝试提取 JSON 前的文字部分作为问题
+                return qMatch[1] + '（AI 已生成设计方案，请确认后进入下一步）';
+            }
+            // 如果问题文本后面才跟 JSON
+            const midJsonIdx = afterQ.search(/\n\s*\{[\s\S]{200,}/);
+            if (midJsonIdx > 0) {
+                return qMatch[1] + afterQ.slice(0, midJsonIdx).trim();
+            }
+        }
+        return content;
+    }
+
+    function _isDesignContent(content) {
+        // 严格格式：有 VERIFY_LOGIC_START 标记
+        if (content.indexOf('VERIFY_LOGIC_START') !== -1) return true;
+        // 宽松格式：有"校验逻辑"+"SP名称"的组合
+        if (/校验逻辑[\s\S]*?SP名称[:：]/.test(content)) return true;
+        // JSON 设计方案格式：包含存储过程列表等关键标识
+        if (/存储过程列表|"名称".*?"用途"|参数定义.*?业务逻辑/.test(content) && /校验/.test(content)) return true;
+        // 标准 Markdown 设计格式
+        if (/##\s*\d*\.?\s*存储过程/.test(content) && content.length > 200) return true;
+        return false;
+    }
+
+    function _userMessageFriendly(content) {
+        // 检测 assumptions 确认 JSON: {"confirmed":[...],"modified":{...}}
+        if (content && content.startsWith('{')) {
+            try {
+                const obj = JSON.parse(content);
+                if (obj.confirmed && Array.isArray(obj.confirmed)) {
+                    const modCount = obj.modified ? Object.keys(obj.modified).length : 0;
+                    let text = '✅ 已确认关键项';
+                    if (modCount > 0) {
+                        text += `（修改了 ${modCount} 项）`;
+                    }
+                    return text;
+                }
+            } catch(e) {}
+        }
+        return content;
     }
 
     async function sendMessage(event) {
@@ -188,12 +477,16 @@
             alert('请先创建会话');
             return;
         }
+        if (isGenerating) return;
 
         const container = document.getElementById('chat-messages');
 
         // 显示用户消息
         appendMessage(container, 'user', message);
         input.value = '';
+
+        // 切换为生成状态
+        setGeneratingState(true);
 
         // 创建 assistant 占位 div
         const assistantDiv = document.createElement('div');
@@ -202,6 +495,7 @@
         container.appendChild(assistantDiv);
         container.scrollTop = container.scrollHeight;
 
+        try {
         const r = await fetch('/api/chat/stream', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
@@ -209,6 +503,7 @@
         });
 
         const reader = r.body.getReader();
+        currentReader = reader;
         const decoder = new TextDecoder();
         let buffer = '';
         let assistantText = '';
@@ -231,20 +526,43 @@
                         container.scrollTop = container.scrollHeight;
                     } else if (data.type === 'question') {
                         assistantText = data.content;
-                        assistantDiv.innerHTML = renderMarkdown(data.content);
+                        assistantDiv.innerHTML = renderMarkdown(data.content)
+                            + renderQuickActions([
+                                {label: '⏭️ 跳过确认，直接设计', text: '不需要再问了，请直接生成设计方案', style: 'secondary'},
+                            ]);
+                    } else if (data.type === 'assumptions') {
+                        assistantText = data.content;
+                        assistantDiv.innerHTML = renderAssumptions(data.assumptions || []);
                     } else if (data.type === 'design') {
                         assistantText = data.content;
-                        assistantDiv.innerHTML = '<strong>📋 设计方案：</strong><br><pre style="white-space:pre-wrap;font-size:13px;margin-top:4px;">' + escapeHtml(data.content) + '</pre>';
+                        assistantDiv.innerHTML = '<div class="design-block"><div class="design-header">📋 设计方案</div><div class="design-content">' + renderDesignContent(data.content) + '</div><div class="design-hint">👆 请确认方案，或回复修改意见</div></div>'
+                            + renderQuickActions([
+                                {label: '✅ 确认方案，开始生成', text: '确认，请开始生成存储过程', style: 'primary'},
+                                {label: '🔄 重新设计', text: '请重新设计方案', style: 'secondary'},
+                            ]);
                     } else if (data.type === 'auto_fix_progress') {
                         assistantText = data.content;
                         assistantDiv.innerHTML = '<em style="color:#e67e22;">⏳ ' + escapeHtml(data.content) + '</em>';
                     } else if (data.type === 'verify_result') {
                         assistantText = data.content;
-                        // 渲染校验结果到聊天区（改回 assistant 样式，避免被前一个 error 事件设为 message error 后白字）
+                        // 渲染校验结果到聊天区
                         assistantDiv.className = 'message assistant';
                         assistantDiv.innerHTML = renderVerifyResult(data.content, data.data);
-                        // 同步更新右侧 SP 卡片：状态标签 + 内联校验结果
+                        // 判断校验是否全部通过
                         const vResults = (data.data && data.data.verify_results) ? data.data.verify_results : [];
+                        const allPassed = vResults.length > 0 && vResults.every(vr => vr.syntax_ok && vr.business_ok);
+                        if (allPassed) {
+                            assistantDiv.innerHTML += renderQuickActions([
+                                {label: '🚀 一键部署', action: 'deploy', style: 'primary'},
+                                {label: '🔄 重新生成', text: '请重新生成存储过程', style: 'secondary'},
+                            ]);
+                        } else {
+                            assistantDiv.innerHTML += renderQuickActions([
+                                {label: '🔧 自动修复', text: '请修复校验失败的存储过程', style: 'primary'},
+                                {label: '🔄 重新生成', text: '请重新生成存储过程', style: 'secondary'},
+                            ]);
+                        }
+                        // 同步更新右侧 SP 卡片
                         for (const vr of vResults) {
                             lastVerifyResults[vr.sp_id] = vr;
                             refreshSpStatusInPlace(vr.sp_id, vr);
@@ -264,7 +582,10 @@
                         loadSpList();
                     } else if (data.type === 'error') {
                         assistantDiv.className = 'message error';
-                        assistantDiv.innerHTML = renderMarkdown(data.content);
+                        assistantDiv.innerHTML = renderMarkdown(data.content)
+                            + renderQuickActions([
+                                {label: '🔄 重试', text: '请重试', style: 'secondary'},
+                            ]);
                     }
                 } catch(e) {}
             }
@@ -274,6 +595,202 @@
         if (!assistantText && assistantDiv.textContent === '思考中...') {
             assistantDiv.textContent = '处理完成';
         }
+        // 流式消息完成后添加复制按钮
+        assistantDiv.setAttribute('data-raw-content', assistantText || '');
+        addCopyButton(assistantDiv);
+        } catch(e) {
+            if (e.name !== 'AbortError' && e.message !== 'The reader was released.') {
+                console.error('Stream error:', e);
+            }
+            if (assistantDiv.textContent === '思考中...') {
+                assistantDiv.textContent = '已停止';
+                assistantDiv.className = 'message assistant stopped';
+            }
+        } finally {
+            currentReader = null;
+            setGeneratingState(false);
+        }
+    }
+
+    function renderQuickActions(actions) {
+        let html = '<div class="quick-actions">';
+        for (const a of actions) {
+            if (a.action === 'deploy') {
+                html += `<button class="quick-btn ${a.style}" onclick="quickDeploy(this)">${a.label}</button>`;
+            } else {
+                html += `<button class="quick-btn ${a.style}" onclick="quickSend(this, '${escapeHtml(a.text)}')">${a.label}</button>`;
+            }
+        }
+        html += '</div>';
+        return html;
+    }
+
+    // ====== 复制按钮功能 ======
+    function addCopyButton(msgDiv) {
+        // 避免重复添加
+        if (msgDiv.querySelector('.msg-copy-btn')) return;
+        const btn = document.createElement('button');
+        btn.className = 'msg-copy-btn';
+        btn.textContent = '📋';
+        btn.title = '复制内容';
+        btn.onclick = function(e) {
+            e.stopPropagation();
+            copyMessageContent(msgDiv, btn);
+        };
+        msgDiv.appendChild(btn);
+    }
+
+    function copyMessageContent(msgDiv, btn) {
+        // 优先使用保存的原始文本内容
+        let text = msgDiv.getAttribute('data-raw-content');
+        if (!text) {
+            // fallback: 提取DOM中的纯文本（排除按钮文字）
+            const clone = msgDiv.cloneNode(true);
+            // 移除复制按钮和快捷操作按钮
+            clone.querySelectorAll('.msg-copy-btn, .quick-actions').forEach(el => el.remove());
+            text = clone.textContent || clone.innerText || '';
+        }
+        text = text.trim();
+        if (!text) return;
+
+        function onSuccess() {
+            btn.textContent = '✅';
+            btn.classList.add('copied');
+            setTimeout(function() {
+                btn.textContent = '📋';
+                btn.classList.remove('copied');
+            }, 2000);
+        }
+
+        function fallbackCopy() {
+            const textarea = document.createElement('textarea');
+            textarea.value = text;
+            textarea.style.position = 'fixed';
+            textarea.style.left = '-9999px';
+            textarea.style.opacity = '0';
+            document.body.appendChild(textarea);
+            textarea.focus();
+            textarea.select();
+            try {
+                document.execCommand('copy');
+                onSuccess();
+            } catch(e) {
+                btn.textContent = '❌';
+                setTimeout(function() { btn.textContent = '📋'; }, 2000);
+            }
+            document.body.removeChild(textarea);
+        }
+
+        // navigator.clipboard 仅在安全上下文（HTTPS/localhost）中可用
+        if (navigator.clipboard && window.isSecureContext) {
+            navigator.clipboard.writeText(text).then(onSuccess).catch(fallbackCopy);
+        } else {
+            fallbackCopy();
+        }
+    }
+
+    // ====== 关键项确认 UI ======
+    function renderAssumptions(assumptions) {
+        let html = '<div class="assumptions-block">';
+        html += '<div class="assumptions-header">🔑 关键项确认</div>';
+        html += '<div class="assumptions-hint">请逐项确认以下关键项，确认后将据此进行设计</div>';
+        html += '<div class="assumptions-list">';
+        for (let i = 0; i < assumptions.length; i++) {
+            const a = assumptions[i];
+            html += `<div class="assumption-item" data-key="${escapeHtml(a.key)}" data-index="${i}">`;
+            html += `<div class="assumption-main">`;
+            html += `<div class="assumption-info">`;
+            html += `<span class="assumption-title">${escapeHtml(a.title)}</span>`;
+            html += `<span class="assumption-value">${escapeHtml(a.value)}</span>`;
+            if (a.reason) {
+                html += `<span class="assumption-reason">${escapeHtml(a.reason)}</span>`;
+            }
+            html += `</div>`;
+            html += `<div class="assumption-actions">`;
+            html += `<button class="assumption-btn agree active" onclick="toggleAssumption(this, '${escapeHtml(a.key)}', true)">✅ 同意</button>`;
+            html += `<button class="assumption-btn modify" onclick="toggleAssumption(this, '${escapeHtml(a.key)}', false)">✏️ 修改</button>`;
+            html += `</div>`;
+            html += `</div>`;
+            html += `<div class="assumption-edit" style="display:none;">`;
+            html += `<input type="text" class="assumption-input" id="assumption-input-${escapeHtml(a.key)}" placeholder="输入修改后的值..." value="${escapeHtml(a.value)}">`;
+            html += `</div>`;
+            html += `</div>`;
+        }
+        html += '</div>';
+        html += '<div class="assumptions-footer">';
+        html += '<button class="quick-btn primary" onclick="submitAssumptions()">✅ 确认关键项，开始设计</button>';
+        html += '</div>';
+        html += '</div>';
+        return html;
+    }
+
+    // 存储当前关键项状态
+    let _assumptionsState = {};
+
+    function toggleAssumption(btn, key, isAgree) {
+        const item = btn.closest('.assumption-item');
+        const editDiv = item.querySelector('.assumption-edit');
+        const agreeBtn = item.querySelector('.assumption-btn.agree');
+        const modifyBtn = item.querySelector('.assumption-btn.modify');
+
+        if (isAgree) {
+            agreeBtn.classList.add('active');
+            modifyBtn.classList.remove('active');
+            editDiv.style.display = 'none';
+            _assumptionsState[key] = {type: 'agree'};
+        } else {
+            modifyBtn.classList.add('active');
+            agreeBtn.classList.remove('active');
+            editDiv.style.display = 'block';
+            editDiv.querySelector('input').focus();
+            _assumptionsState[key] = {type: 'modify'};
+        }
+    }
+
+    function submitAssumptions() {
+        // 收集所有关键项的确认结果
+        const items = document.querySelectorAll('.assumption-item');
+        const confirmed = [];
+        const modified = {};
+
+        items.forEach(item => {
+            const key = item.getAttribute('data-key');
+            const modifyBtn = item.querySelector('.assumption-btn.modify');
+            const isModified = modifyBtn.classList.contains('active');
+
+            if (isModified) {
+                const input = item.querySelector('.assumption-input');
+                const val = input.value.trim();
+                if (val) {
+                    modified[key] = val;
+                }
+            } else {
+                confirmed.push(key);
+            }
+        });
+
+        // 构造 JSON 消息发送
+        const payload = JSON.stringify({confirmed, modified});
+
+        // 模拟用户输入发送
+        const input = document.getElementById('chat-input');
+        input.value = payload;
+        document.getElementById('chat-form').dispatchEvent(new Event('submit', {cancelable: true}));
+    }
+
+    function quickSend(btn, text) {
+        // 移除所有快捷按钮（避免重复点击）
+        const actionsDiv = btn.closest('.quick-actions');
+        if (actionsDiv) actionsDiv.remove();
+        // 填入输入框并发送
+        document.getElementById('chat-input').value = text;
+        document.getElementById('chat-form').dispatchEvent(new Event('submit', {cancelable: true}));
+    }
+
+    function quickDeploy(btn) {
+        const actionsDiv = btn.closest('.quick-actions');
+        if (actionsDiv) actionsDiv.remove();
+        deployAll();
     }
 
     function renderVerifyResult(text, nodeData) {
@@ -413,7 +930,16 @@
                     <div class="sp-actions">
                         <button class="verify-btn" onclick="verifySp('${sp.id}')">🔍 校验</button>
                         <button class="save-verify-btn" onclick="saveAndVerifySp('${sp.id}')">💾 校验+保存</button>
+                        <button class="execute-btn" onclick="executeSp('${sp.id}')">▶️ 执行</button>
                         <span class="sp-action-status" id="sp-action-status-${sp.id}"></span>
+                    </div>
+                    <div class="sp-execute-result" id="sp-exec-result-${sp.id}" style="display:none;">
+                        <div class="exec-result-header">
+                            <span class="exec-result-title">📊 执行结果</span>
+                            <button class="export-btn" onclick="exportExcel('${sp.id}')">📥 导出 Excel</button>
+                            <button class="close-result-btn" onclick="closeExecResult('${sp.id}')">✕</button>
+                        </div>
+                        <div class="exec-result-body" id="sp-exec-table-${sp.id}"></div>
                     </div>
                     <div class="sp-verify-result" id="sp-verify-result-${sp.id}" style="display:none;"></div>
                 </div>
@@ -554,6 +1080,158 @@
 
     // ====== SP 校验 / 保存+校验 ======
 
+    // ====== 执行存储过程 ======
+    let execResultsCache = {};  // 缓存执行结果 {sp_id: {columns, rows}}
+
+    async function executeSp(spId) {
+        const statusEl = document.getElementById('sp-action-status-' + spId);
+        statusEl.textContent = '⏳ 执行中...';
+
+        // 收集参数
+        const params = {};
+        const paramInputs = document.querySelectorAll(`[id^="param-${spId}-"]`);
+        paramInputs.forEach(input => {
+            const name = input.id.replace(`param-${spId}-`, '');
+            if (input.value.trim()) {
+                params[name] = input.value.trim();
+            }
+        });
+
+        try {
+            const r = await fetch(`/api/sp/execute/${spId}`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({params}),
+            });
+            const data = await r.json();
+
+            if (!data.ok) {
+                statusEl.textContent = '❌ 执行失败';
+                const resultDiv = document.getElementById('sp-exec-result-' + spId);
+                const tableDiv = document.getElementById('sp-exec-table-' + spId);
+                resultDiv.style.display = 'block';
+                tableDiv.innerHTML = `<div class="exec-error">❌ ${escapeHtml(data.error || '未知错误')}</div>`;
+                return;
+            }
+
+            // 缓存结果
+            execResultsCache[spId] = {columns: data.columns, rows: data.rows};
+
+            // 渲染表格
+            const resultDiv = document.getElementById('sp-exec-result-' + spId);
+            const tableDiv = document.getElementById('sp-exec-table-' + spId);
+            resultDiv.style.display = 'block';
+
+            if (!data.columns || data.columns.length === 0) {
+                tableDiv.innerHTML = '<div class="exec-empty">执行成功，无返回数据</div>';
+                statusEl.textContent = '✅ 执行完成（无数据）';
+                return;
+            }
+
+            let tableHtml = `<div class="exec-summary">共 ${data.rows.length} 行 × ${data.columns.length} 列</div>`;
+            tableHtml += '<div class="exec-table-wrap"><table class="exec-table"><thead><tr>';
+            for (const col of data.columns) {
+                tableHtml += `<th>${escapeHtml(col)}</th>`;
+            }
+            tableHtml += '</tr></thead><tbody>';
+            // 最多显示 200 行
+            const displayRows = data.rows.slice(0, 200);
+            for (const row of displayRows) {
+                tableHtml += '<tr>';
+                for (const col of data.columns) {
+                    const val = row[col];
+                    tableHtml += `<td>${val === null ? '<span class="null-val">NULL</span>' : escapeHtml(String(val))}</td>`;
+                }
+                tableHtml += '</tr>';
+            }
+            tableHtml += '</tbody>';
+
+            // 计算合计行（对数值列求和/计数）
+            const allRows = data.rows;
+            const colStats = {};
+            for (const col of data.columns) {
+                let sum = 0, count = 0, isNumeric = false;
+                for (const row of allRows) {
+                    const val = row[col];
+                    if (val === null || val === '') continue;
+                    const num = Number(val);
+                    if (!isNaN(num) && typeof val !== 'boolean') {
+                        sum += num;
+                        count++;
+                        isNumeric = true;
+                    }
+                }
+                colStats[col] = { isNumeric, sum, count };
+            }
+            // 判断是否有数值列需要合计
+            const hasNumericCols = data.columns.some(col => colStats[col].isNumeric && colStats[col].count > 0);
+            if (hasNumericCols) {
+                tableHtml += '<tfoot><tr class="exec-summary-row">';
+                for (const col of data.columns) {
+                    const stat = colStats[col];
+                    if (stat.isNumeric && stat.count > 0) {
+                        // 格式化数字：保留2位小数，去除不必要的尾零
+                        const formatted = stat.sum % 1 === 0 ? stat.sum.toLocaleString() : stat.sum.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+                        tableHtml += `<td class="summary-cell"><strong>${formatted}</strong></td>`;
+                    } else if (data.columns.indexOf(col) === 0) {
+                        tableHtml += `<td class="summary-cell summary-label"><strong>合计</strong></td>`;
+                    } else {
+                        tableHtml += `<td class="summary-cell">—</td>`;
+                    }
+                }
+                tableHtml += '</tr></tfoot>';
+            }
+
+            tableHtml += '</table></div>';
+            if (data.rows.length > 200) {
+                tableHtml += `<div class="exec-truncated">⚠️ 仅显示前 200 行，完整数据请导出 Excel</div>`;
+            }
+            tableDiv.innerHTML = tableHtml;
+            statusEl.textContent = `✅ ${data.rows.length} 行`;
+        } catch(e) {
+            statusEl.textContent = '❌ 请求失败';
+        }
+    }
+
+    function closeExecResult(spId) {
+        document.getElementById('sp-exec-result-' + spId).style.display = 'none';
+    }
+
+    function exportExcel(spId) {
+        const data = execResultsCache[spId];
+        if (!data || !data.columns || data.columns.length === 0) {
+            alert('没有可导出的数据');
+            return;
+        }
+
+        // 生成 CSV（兼容 Excel 的 UTF-8 BOM）
+        const BOM = '\uFEFF';
+        let csv = BOM;
+
+        // 表头
+        csv += data.columns.map(col => `"${col.replace(/"/g, '""')}"`).join(',') + '\n';
+
+        // 数据行
+        for (const row of data.rows) {
+            const cells = data.columns.map(col => {
+                const val = row[col];
+                if (val === null) return '';
+                const str = String(val).replace(/"/g, '""');
+                return `"${str}"`;
+            });
+            csv += cells.join(',') + '\n';
+        }
+
+        // 下载
+        const blob = new Blob([csv], {type: 'text/csv;charset=utf-8;'});
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `SP_Result_${new Date().toISOString().slice(0,10)}.csv`;
+        a.click();
+        URL.revokeObjectURL(url);
+    }
+
     async function verifySp(spId) {
         const statusEl = document.getElementById('sp-action-status-' + spId);
         if (!statusEl) return;
@@ -575,8 +1253,14 @@
             if (data.ok) {
                 refreshSpStatusInPlace(spId, data.result);
                 showSpVerifyResult(spId, data.result);
-                statusEl.textContent = '✅ 校验完成';
-                statusEl.className = 'sp-action-status success';
+                const allPass = data.result && data.result.syntax_ok && data.result.business_ok;
+                if (allPass) {
+                    statusEl.textContent = '✅ 校验完成';
+                    statusEl.className = 'sp-action-status success';
+                } else {
+                    statusEl.textContent = '❌ 校验未通过';
+                    statusEl.className = 'sp-action-status fail';
+                }
             } else {
                 statusEl.textContent = '❌ ' + (data.message || '校验失败');
                 statusEl.className = 'sp-action-status fail';
@@ -616,8 +1300,14 @@
             if (data.ok) {
                 refreshSpStatusInPlace(spId, data.result);
                 showSpVerifyResult(spId, data.result);
-                statusEl.textContent = '✅ 保存并校验完成';
-                statusEl.className = 'sp-action-status success';
+                const allPass = data.result && data.result.syntax_ok && data.result.business_ok;
+                if (allPass) {
+                    statusEl.textContent = '✅ 保存并校验完成';
+                    statusEl.className = 'sp-action-status success';
+                } else {
+                    statusEl.textContent = '❌ 校验未通过';
+                    statusEl.className = 'sp-action-status fail';
+                }
             } else {
                 statusEl.textContent = '❌ ' + (data.message || '校验失败');
                 statusEl.className = 'sp-action-status fail';
@@ -689,7 +1379,26 @@
                     html += `<div class="spr-row fail">❌ 语法错误: ${escapeHtml((d.error||'').substring(0,200))}</div>`;
                 } else if (d.type === 'business') {
                     const mark = d.pass ? '✅' : '❌';
-                    const detail = d.data ? ('数据: ' + escapeHtml(JSON.stringify(d.data).substring(0,120))) : (d.error ? escapeHtml(String(d.error).substring(0,200)) : '');
+                    let detail = '';
+                    // 优先显示对比结果
+                    if (d.comparison && d.comparison.summary) {
+                        detail = escapeHtml(d.comparison.summary);
+                        // 如果有详细对比列，展示对比表格
+                        if (d.comparison.details && d.comparison.details.length > 0) {
+                            detail += '<table class="compare-table"><thead><tr><th>列名</th><th>SP 值</th><th>校验值</th><th>结果</th></tr></thead><tbody>';
+                            for (const col of d.comparison.details) {
+                                const colMark = col.match ? '✅' : '❌';
+                                const spVal = col.sp_value !== null && col.sp_value !== undefined ? String(col.sp_value) : 'NULL';
+                                const vqVal = col.verify_value !== null && col.verify_value !== undefined ? String(col.verify_value) : 'NULL';
+                                detail += `<tr class="${col.match?'':'mismatch'}"><td>${escapeHtml(col.column)}</td><td>${escapeHtml(spVal)}</td><td>${escapeHtml(vqVal)}</td><td>${colMark}</td></tr>`;
+                            }
+                            detail += '</tbody></table>';
+                        }
+                    } else if (d.data) {
+                        detail = '数据: ' + escapeHtml(JSON.stringify(d.data).substring(0,120));
+                    } else if (d.error) {
+                        detail = escapeHtml(String(d.error).substring(0,200));
+                    }
                     html += `<div class="spr-row ${d.pass?'pass':'fail'}">${mark} ${escapeHtml(d.query||'')}: ${detail}</div>`;
                 }
             }

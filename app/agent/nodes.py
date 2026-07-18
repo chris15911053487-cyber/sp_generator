@@ -9,7 +9,7 @@ from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, Tool
 from app.agent.prompts import (
     SYSTEM_PROMPT, CLARIFY_PROMPT, DESIGN_PROMPT,
     GENERATE_PROMPT, VERIFY_SQL_PROMPT, VERIFY_PROMPT,
-    DESIGN_FEEDBACK_PROMPT, FIX_SP_PROMPT,
+    DESIGN_FEEDBACK_PROMPT, FIX_SP_PROMPT, ASSUMPTIONS_PROMPT,
 )
 from app.agent.tools import create_tools
 from app.db.sqlserver import check_syntax, execute_query, deploy_procedure, substitute_params
@@ -22,6 +22,7 @@ class AgentState(TypedDict):
     user_input: str
     mode: str
     requirements: str
+    confirmed_assumptions: str
     design: str
     sp_list: list
     verify_results: list
@@ -159,12 +160,35 @@ def _build_chat_history(session_id: str, max_msgs: int = 10) -> str:
 
 def _extract_first_question(content: str) -> str:
     """LLM 违规一次输出多个问题时，只截取第一个问题。
+    LLM 违规直接输出设计方案 JSON 时，返回友好提示。
 
     识别"第二个问题"的标记：行首的 `### 问题`、`问题N`、`Q N` 等。
     只有一个问题或无标记时原样返回。
     """
     if not content:
         return content
+
+    # 检测 LLM 是否违规输出了 JSON 设计方案（而非提问）
+    stripped = content.strip()
+    # 情况1：内容以 { 开头，是纯 JSON
+    if stripped.startswith('{') and len(stripped) > 200:
+        return "信息已足够，我将为您生成设计方案。"
+    # 情况2：少量文字后跟大段 JSON
+    json_start = stripped.find('{')
+    if json_start > 0 and json_start < 100 and (len(stripped) - json_start) > 200:
+        # 尝试提取 JSON 之前的文字作为问题
+        before_json = stripped[:json_start].strip()
+        # 如果前面的文字像问题（含问号或选项），保留
+        if '?' in before_json or '？' in before_json or '\nA' in before_json:
+            return before_json
+        return "信息已足够，我将为您生成设计方案。"
+    # 情况3：```json 代码块
+    if '```json' in stripped and len(stripped) > 300:
+        before_code = stripped.split('```json')[0].strip()
+        if before_code and ('?' in before_code or '？' in before_code):
+            return before_code
+        return "信息已足够，我将为您生成设计方案。"
+
     # 匹配行首的问题标记（第二个及以后）
     marks = list(re.finditer(r'(?:^|\n)\s*(?:#{1,4}\s*)?(?:问题|Q)\s*\d+\s*[：:]', content))
     if len(marks) >= 2:
@@ -193,29 +217,40 @@ def _classify_design_feedback(llm: ChatOpenAI, design: str, feedback: str) -> tu
 
 
 def clarify_node(state: AgentState, config: dict = None) -> dict:
-    """需求澄清节点 — 系统控制编号，最多 5 个问题，可提前结束。"""
+    """需求确认节点 — 系统控制编号，最多 5 个问题，可提前结束。"""
     llm = _get_llm()
     stream_writer = config.get("configurable", {}).get("__pregel_stream_writer") if config else None
+
+    # 如果 mode 已经跳过了需求确认阶段，直接 pass-through
+    current_mode = state.get("mode", "clarify")
+    if current_mode in ("assumptions", "design", "generate"):
+        return {
+            "requirements": state.get("requirements", ""),
+            "mode": current_mode,
+            "status": state.get("status", ""),
+            "clarify_count": state.get("clarify_count", 0),
+        }
+
     chat_history = _build_chat_history(state["session_id"])
     clarified = state.get("requirements", "")
     clarify_count = state.get("clarify_count", 0) or 0
 
-    # 上限 5：已问满 5 个，强制进设计
+    # 上限 5：已问满 5 个，强制进入关键项确认
     if clarify_count >= 5:
         return {
             "requirements": clarified,
-            "mode": "design",
+            "mode": "assumptions",
             "status": "clarified",
             "clarify_count": clarify_count,
         }
 
-    # 外部安全网：用户消息过多仍强制进设计（防止 clarify_count 状态丢失）
+    # 外部安全网：用户消息过多仍强制进入关键项确认（防止 clarify_count 状态丢失）
     msgs = get_messages(state["session_id"])
     user_count = sum(1 for m in msgs if m["role"] == "user")
     if user_count >= 6:
         return {
             "requirements": clarified,
-            "mode": "design",
+            "mode": "assumptions",
             "status": "clarified",
             "clarify_count": clarify_count,
         }
@@ -235,15 +270,33 @@ def clarify_node(state: AgentState, config: dict = None) -> dict:
         last_question_hint=last_question_hint,
     )
     messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=prompt)]
-    response = _invoke_with_tools(llm, messages, max_rounds=1, stream_writer=stream_writer)
+    # 注意：clarify 阶段不使用 stream_writer，避免 LLM 不规范输出（如 JSON 设计方案）
+    # 被提前推送到前端。最终问题通过 interrupt 事件发送。
+    response = _invoke_with_tools(llm, messages, max_rounds=1)
 
     if "INFO_SUFFICIENT" in response.content:
         return {
             "requirements": response.content.replace("INFO_SUFFICIENT", "").strip(),
-            "mode": "design",
+            "mode": "assumptions",
             "status": "clarified",
             "clarify_count": clarify_count,
         }
+
+    # 检测 LLM 是否违规输出了 JSON 设计方案（而非提问）
+    # 如果是，说明 LLM 认为信息足够，直接进入 assumptions 阶段
+    content_stripped = response.content.strip()
+    if content_stripped.startswith('{') and len(content_stripped) > 200:
+        try:
+            obj = json.loads(content_stripped)
+            if any(k in obj for k in ('stored_procedure', 'procedures', '存储过程列表', 'sp_list')):
+                return {
+                    "requirements": clarified or state["user_input"],
+                    "mode": "assumptions",
+                    "status": "clarified",
+                    "clarify_count": clarify_count,
+                }
+        except (json.JSONDecodeError, ValueError):
+            pass
 
     # 截断 LLM 违规输出的多个问题，只取第一个；系统负责编号
     question = _extract_first_question(response.content)
@@ -260,6 +313,76 @@ def clarify_node(state: AgentState, config: dict = None) -> dict:
         "mode": "clarify",
         "status": "clarifying",
         "clarify_count": clarify_count + 1,
+    }
+
+
+def assumptions_node(state: AgentState, config: dict = None) -> dict:
+    """关键项确认节点 — LLM 生成关键假设列表，用户逐项确认/修改后进入设计。"""
+    llm = _get_llm()
+
+    # 如果 mode 已跳过，直接 pass-through
+    current_mode = state.get("mode", "assumptions")
+    if current_mode in ("design", "generate"):
+        return {
+            "confirmed_assumptions": state.get("confirmed_assumptions", ""),
+            "mode": current_mode,
+        }
+
+    # 调用 LLM 生成关键项列表
+    prompt = ASSUMPTIONS_PROMPT.format(requirements=state.get("requirements", ""))
+    messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=prompt)]
+    response = llm.invoke(messages)
+
+    # 解析 JSON
+    assumptions_data = _parse_json(response.content)
+    assumptions_list = []
+    if assumptions_data and "assumptions" in assumptions_data:
+        assumptions_list = assumptions_data["assumptions"]
+
+    if not assumptions_list:
+        # 无关键项需确认，直接进入设计
+        return {
+            "confirmed_assumptions": "无特殊关键项",
+            "mode": "design",
+            "status": "assumptions_confirmed",
+        }
+
+    # 中断等待用户确认：前端渲染勾选列表
+    user_response = interrupt({
+        "type": "assumptions",
+        "assumptions": assumptions_list,
+    })
+
+    # user_response 格式：{"confirmed": [...], "modified": {...}}
+    # confirmed: 用户同意的 key 列表
+    # modified: {key: "用户修改后的值"} 用户修改了的项
+    confirmed_keys = []
+    modified_items = {}
+    if isinstance(user_response, dict):
+        confirmed_keys = user_response.get("confirmed", [])
+        modified_items = user_response.get("modified", {})
+    elif isinstance(user_response, str):
+        # fallback: 用户直接输入文本，视为全部确认
+        confirmed_keys = [a["key"] for a in assumptions_list]
+
+    # 构建确认结果文本
+    lines = []
+    for a in assumptions_list:
+        key = a["key"]
+        if key in modified_items:
+            lines.append(f"- {a['title']}：{modified_items[key]}（用户修改）")
+        elif key in confirmed_keys:
+            lines.append(f"- {a['title']}：{a['value']}（已确认）")
+        else:
+            # 未勾选的项 — 忽略，不纳入设计
+            pass
+
+    confirmed_text = "\n".join(lines) if lines else "用户未确认任何关键项，使用默认设置"
+
+    return {
+        "confirmed_assumptions": confirmed_text,
+        "mode": "design",
+        "status": "assumptions_confirmed",
     }
 
 
@@ -331,7 +454,11 @@ def design_node(state: AgentState, config: dict = None) -> dict:
     # === 第一阶段：初次生成方案（如已有方案则复用，避免 IRRELEVANT 循环时重新生成） ===
     design = state.get("design", "")
     if not design:
-        prompt = DESIGN_PROMPT.format(requirements=state["requirements"])
+        confirmed_assumptions = state.get("confirmed_assumptions", "无特殊关键项")
+        prompt = DESIGN_PROMPT.format(
+            requirements=state["requirements"],
+            confirmed_assumptions=confirmed_assumptions,
+        )
         messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=prompt)]
         response = _invoke_with_tools(llm, messages, max_rounds=3, stream_writer=stream_writer)
         design = response.content
@@ -460,7 +587,75 @@ def _merge_parameters(sp_params: list[dict], sql_placeholders: set[str],
     return list(param_map.values())
 
 
-def _generate_verify_sql_for_sp(llm: ChatOpenAI, sp_row: dict, design: str) -> dict:
+def _extract_verify_logic(design: str) -> dict[str, list[dict]]:
+    """从设计方案文本中提取结构化的校验逻辑。
+
+    返回 {sp_name: [{"name": ..., "description": ..., "compare_columns": ...}, ...]}
+    兼容两种格式：
+    1. 严格格式：<!-- VERIFY_LOGIC_START --> ... <!-- VERIFY_LOGIC_END -->
+    2. 宽松格式：以"校验逻辑"为标题，后跟 SP名称 + 校验N 的内容块
+    """
+    result = {}
+    # 优先尝试严格格式
+    m = re.search(r'<!--\s*VERIFY_LOGIC_START\s*-->(.*?)<!--\s*VERIFY_LOGIC_END\s*-->', design, re.DOTALL)
+    if m:
+        block = m.group(1).strip()
+    else:
+        # 宽松匹配：查找"校验逻辑"标题后的内容块（兼容编号标题如 "## 2. 校验逻辑描述"）
+        m2 = re.search(r'(?:^|\n)[#*\s\d.]*校验逻辑(?:描述)?[^\n]*\n([\s\S]*?)(?=\n##\s|\Z)', design)
+        if not m2:
+            return result
+        block = m2.group(1).strip()
+
+    current_sp = None
+
+    for line in block.split('\n'):
+        line = line.strip()
+        if not line:
+            continue
+
+        # 匹配 SP 名称行: 兼容 "- SP名称: sp_XXX" 和 "SP名称: sp_XXX"
+        sp_match = re.match(r'^(?:-\s*)?SP名称[:：]\s*(.+)$', line, re.IGNORECASE)
+        if sp_match:
+            current_sp = sp_match.group(1).strip()
+            result[current_sp] = []
+            continue
+
+        # 匹配校验项行: 兼容 "- 校验N: ..." 和 "校验N: ..."
+        vq_match = re.match(r'^(?:-\s*)?校验\d+[:：]\s*(.+)$', line)
+        if vq_match and current_sp:
+            parts = [p.strip() for p in vq_match.group(1).split('|')]
+            if len(parts) >= 2:
+                entry = {
+                    "name": parts[0],
+                    "description": parts[1],
+                    "compare_columns": parts[2] if len(parts) >= 3 else "",
+                }
+                result[current_sp].append(entry)
+
+    return result
+
+
+def _get_verify_logic_for_sp(verify_logic: dict[str, list[dict]], sp_name: str) -> str:
+    """获取指定SP的校验逻辑描述文本，用于传给VERIFY_SQL_PROMPT。"""
+    # 精确匹配
+    items = verify_logic.get(sp_name, [])
+    if not items:
+        # 模糊匹配（SP名称可能有前缀差异）
+        for key, val in verify_logic.items():
+            if key.lower() in sp_name.lower() or sp_name.lower() in key.lower():
+                items = val
+                break
+    if not items:
+        return ""
+
+    lines = []
+    for i, item in enumerate(items, 1):
+        lines.append(f"校验{i}: {item['name']} — {item['description']}（对比列: {item['compare_columns']}）")
+    return "\n".join(lines)
+
+
+def _generate_verify_sql_for_sp(llm: ChatOpenAI, sp_row: dict, design: str, verify_logic_text: str = "") -> dict:
     """为单个 SP 生成校验 SQL（可并行调用）。返回更新后的 sp_row。"""
     sp_params = _parse_sp_params(sp_row.get("code", ""))
     verify_queries: list = []
@@ -471,6 +666,7 @@ def _generate_verify_sql_for_sp(llm: ChatOpenAI, sp_row: dict, design: str) -> d
         sp_name=sp_row["name"],
         sp_code=sp_row["code"],
         design=design,
+        verify_logic=verify_logic_text or "无（请根据SP代码自行设计校验逻辑）",
     )
     vq_messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=vq_prompt)]
     vq_response = _invoke_with_tools(llm, vq_messages, max_rounds=3)
@@ -544,10 +740,17 @@ def generate_node(state: AgentState, config: dict = None) -> dict:
     # === 阶段 2：并行生成校验 SQL ===
     # 注意：旧 SP 暂不删除，等阶段 2 全部完成后统一替换，
     # 避免校验 SQL 生成中途出错导致旧 SP 已丢、新 SP 不完整
+
+    # 从设计方案中提取结构化校验逻辑
+    verify_logic_map = _extract_verify_logic(design)
+
     MAX_PARALLEL = 3  # 最大并行数，避免 LLM API 限流
     with ThreadPoolExecutor(max_workers=MAX_PARALLEL) as executor:
         futures = {
-            executor.submit(_generate_verify_sql_for_sp, llm, sp_row, design): sp_row
+            executor.submit(
+                _generate_verify_sql_for_sp, llm, sp_row, design,
+                _get_verify_logic_for_sp(verify_logic_map, sp_row["name"])
+            ): sp_row
             for sp_row in sp_list
         }
         for future in as_completed(futures):
@@ -597,7 +800,16 @@ def verify_node(state: AgentState, config: dict = None) -> dict:
             # === 语法校验 ===
             syntax_ok, syntax_err = check_syntax(current_code)
 
-            # === 业务校验 ===
+            # === 部署 SP（语法通过后临时部署，用于数据对比） ===
+            sp_deployed = False
+            if syntax_ok:
+                from app.db.sqlserver import deploy_procedure as _deploy_sp
+                deploy_ok, deploy_err = _deploy_sp(sp.get("name", ""), current_code)
+                if deploy_ok:
+                    sp_deployed = True
+                    db_update_sp(sp["id"], status="deployed")
+
+            # === 业务校验（含数据对比） ===
             vqs = get_verify_queries(sp["id"])
             params = {}
             try:
@@ -606,13 +818,52 @@ def verify_node(state: AgentState, config: dict = None) -> dict:
             except (json.JSONDecodeError, KeyError, TypeError):
                 pass
 
+            # 执行 SP 获取结果集
+            sp_rows = None
+            sp_exec_error = None
+            if sp_deployed:
+                try:
+                    from app.db.sqlserver import execute_sp_with_params, compare_sp_results
+                    param_defs = []
+                    try:
+                        param_defs = json.loads(sp.get("parameters", "[]"))
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+                    sp_rows = execute_sp_with_params(sp.get("name", ""), params, param_defs)
+                except Exception as e:
+                    sp_exec_error = str(e)
+
             biz_all_ok = True
             biz_errors = []
             for vq in vqs:
                 try:
                     sql_to_run = substitute_params(vq["sql_code"], params)
                     verify_rows = execute_query(sql_to_run)
-                    update_verify_query(vq["id"], status="pass", result_detail=json.dumps(verify_rows[:20], ensure_ascii=False, indent=2))
+
+                    # 数据对比
+                    compare_columns = vq.get("compare_columns", "")
+                    comparison = None
+                    if sp_rows is not None and compare_columns:
+                        from app.db.sqlserver import compare_sp_results
+                        comparison = compare_sp_results(sp_rows, verify_rows, compare_columns)
+                        is_pass = comparison["match"]
+                    elif sp_exec_error and compare_columns:
+                        is_pass = False
+                        comparison = {"match": False, "summary": f"SP 执行失败: {sp_exec_error}"}
+                    else:
+                        is_pass = True  # 无对比列或 SP 未部署
+
+                    if not is_pass:
+                        biz_all_ok = False
+                        biz_errors.append({
+                            "query": vq["name"],
+                            "error": comparison["summary"] if comparison else "数据不一致",
+                        })
+
+                    result_detail = {"rows": verify_rows[:20], "comparison": comparison}
+                    status = "pass" if is_pass else "fail"
+                    update_verify_query(vq["id"], status=status,
+                                        result_detail=json.dumps(result_detail, ensure_ascii=False, indent=2))
                 except Exception as e:
                     biz_all_ok = False
                     biz_errors.append({"query": vq["name"], "error": str(e)})

@@ -57,15 +57,16 @@ async def api_chat_stream(req: ChatRequest):
                 interrupt_val = _get_interrupt_value(state)
                 itype = interrupt_val.get("type", "") if isinstance(interrupt_val, dict) else ""
 
-                # 如果澄清阶段超过 4 条用户消息，强制进入设计阶段
+                # 如果澄清阶段超过 4 条用户消息，强制进入关键项确认阶段
                 if itype == "clarify" and user_count >= 6:
-                    # 跳过 LLM 澄清，直接用 mode=design 重启 graph
+                    # 跳过需求确认，直接用 mode=assumptions 重启 graph
                     requirements = state.values.get("requirements", "") if state.values else ""
                     new_input = {
                         "session_id": req.session_id,
                         "user_input": req.message,
-                        "mode": "design",
+                        "mode": "assumptions",
                         "requirements": requirements,
+                        "confirmed_assumptions": state.values.get("confirmed_assumptions", "") if state.values else "",
                         "design": "",
                         "sp_list": [],
                         "verify_results": [],
@@ -81,24 +82,49 @@ async def api_chat_stream(req: ChatRequest):
             elif state and state.values:
                 # 继续既有会话
                 mode = state.values.get("mode", "clarify")
-                # 如果已有足够用户消息，强制设为 design 模式
-                if user_count >= 6:
-                    mode = "design"
-                input_state = {
-                    "session_id": req.session_id,
-                    "user_input": req.message,
-                    "mode": mode,
-                    "requirements": state.values.get("requirements", ""),
-                    "design": state.values.get("design", ""),
-                    "sp_list": state.values.get("sp_list", []),
-                    "verify_results": state.values.get("verify_results", []),
-                    "status": state.values.get("status", ""),
-                    "error": state.values.get("error", ""),
-                    "clarify_count": state.values.get("clarify_count", 0),
-                    "design_phase": state.values.get("design_phase"),
-                    "last_feedback_reply": state.values.get("last_feedback_reply", ""),
-                }
-                events = graph.astream(input_state, config, stream_mode=["updates", "custom"])
+                status = state.values.get("status", "")
+
+                # 校验完成后用户追问 → 将用户反馈作为修改需求，重新生成
+                if status in ("verified", "verify_failed") and req.message.strip():
+                    # 把用户反馈追加到设计方案中作为修改要求
+                    design = state.values.get("design", "")
+                    modified_design = design + f"\n\n## 用户修改要求\n{req.message}"
+                    input_state = {
+                        "session_id": req.session_id,
+                        "user_input": req.message,
+                        "mode": "generate",
+                        "requirements": state.values.get("requirements", ""),
+                        "confirmed_assumptions": state.values.get("confirmed_assumptions", ""),
+                        "design": modified_design,
+                        "sp_list": state.values.get("sp_list", []),
+                        "verify_results": [],
+                        "status": "",
+                        "error": "",
+                        "clarify_count": state.values.get("clarify_count", 0),
+                        "design_phase": None,
+                        "last_feedback_reply": "",
+                    }
+                    events = graph.astream(input_state, config, stream_mode=["updates", "custom"])
+                else:
+                    # 如果已有足够用户消息，强制设为 design 模式
+                    if user_count >= 6:
+                        mode = "design"
+                    input_state = {
+                        "session_id": req.session_id,
+                        "user_input": req.message,
+                        "mode": mode,
+                        "requirements": state.values.get("requirements", ""),
+                        "confirmed_assumptions": state.values.get("confirmed_assumptions", ""),
+                        "design": state.values.get("design", ""),
+                        "sp_list": state.values.get("sp_list", []),
+                        "verify_results": state.values.get("verify_results", []),
+                        "status": state.values.get("status", ""),
+                        "error": state.values.get("error", ""),
+                        "clarify_count": state.values.get("clarify_count", 0),
+                        "design_phase": state.values.get("design_phase"),
+                        "last_feedback_reply": state.values.get("last_feedback_reply", ""),
+                    }
+                    events = graph.astream(input_state, config, stream_mode=["updates", "custom"])
             else:
                 # 全新会话
                 input_state = {
@@ -106,6 +132,7 @@ async def api_chat_stream(req: ChatRequest):
                     "user_input": req.message,
                     "mode": "clarify",
                     "requirements": "",
+                    "confirmed_assumptions": "",
                     "design": "",
                     "sp_list": [],
                     "verify_results": [],
@@ -219,6 +246,14 @@ async def api_chat_stream(req: ChatRequest):
                     assistant_response = prefix + interrupt_val.get("question", "")
                     yield f"data: {json.dumps({'type': 'question', 'content': assistant_response})}\n\n"
                     break  # 等待用户输入
+
+                elif itype == "assumptions":
+                    assumptions = interrupt_val.get("assumptions", [])
+                    assistant_response = "请确认以下关键项："
+                    for a in assumptions:
+                        assistant_response += f"\n- {a.get('title', '')}: {a.get('value', '')}"
+                    yield f"data: {json.dumps({'type': 'assumptions', 'content': assistant_response, 'assumptions': assumptions})}\n\n"
+                    break  # 等待用户确认
 
                 elif itype == "design":
                     content = interrupt_val.get("content", "")

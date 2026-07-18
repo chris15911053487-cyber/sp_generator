@@ -1,0 +1,17 @@
+version: "3.8"
+
+services:
+  sp-generator:
+    build: .
+    container_name: sp-generator
+    ports:
+      - "8000:8000"
+    volumes:
+      # 持久化 SQLite 数据（配置信息）
+      - app-data:/app/data
+    environment:
+      - TZ=Asia/Shanghai
+    restart: unless-stopped
+
+volumes:
+  app-data:

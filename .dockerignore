@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+data/
+.git/
+.gitignore
+.superpowers/
+docs/
+test_*.py
+seed_config.py
+CHANGELOG.md
+docker-compose.yml
+Dockerfile
+.dockerignore
