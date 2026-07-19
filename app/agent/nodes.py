@@ -1,15 +1,23 @@
 """LangGraph 节点实现 — 需求澄清、方案设计、代码生成、校验、部署。"""
 import json
 import re
+from functools import lru_cache
+from threading import Lock
 from typing import TypedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from langgraph.types import interrupt
+try:
+    from langgraph.config import get_stream_writer
+except ImportError:  # 兼容较早的 langgraph 版本
+    get_stream_writer = None
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, ToolMessage
+from langchain_core.runnables import RunnableConfig
 from app.agent.prompts import (
     SYSTEM_PROMPT, CLARIFY_PROMPT, DESIGN_PROMPT,
     GENERATE_PROMPT, VERIFY_SQL_PROMPT, VERIFY_PROMPT,
-    DESIGN_FEEDBACK_PROMPT, FIX_SP_PROMPT, ASSUMPTIONS_PROMPT,
+    DESIGN_FEEDBACK_PROMPT, FIX_SP_PROMPT, FIX_VERIFY_SQL_PROMPT,
+    ASSUMPTIONS_PROMPT,
 )
 from app.agent.tools import create_tools
 from app.db.sqlserver import check_syntax, execute_query, deploy_procedure, substitute_params
@@ -35,15 +43,60 @@ class AgentState(TypedDict):
     last_feedback_reply: str
 
 
-def _get_llm() -> ChatOpenAI:
-    cfg = get_llm_config()
+_tools = create_tools()
+_bound_llms: dict[int, tuple[ChatOpenAI, object]] = {}
+_bound_llms_lock = Lock()
+
+
+@lru_cache(maxsize=4)
+def _create_llm(api_key: str, base_url: str, model_name: str) -> ChatOpenAI:
+    """按配置复用底层 HTTP 客户端；配置变化会自然创建一个新实例。"""
     return ChatOpenAI(
-        api_key=cfg["api_key"],
-        base_url=cfg["base_url"],
-        model=cfg["model_name"],
+        api_key=api_key,
+        base_url=base_url,
+        model=model_name,
         temperature=0.1,
         streaming=True,
+        timeout=120,
+        max_retries=0,
     )
+
+
+def _get_llm() -> ChatOpenAI:
+    cfg = get_llm_config()
+    return _create_llm(cfg["api_key"], cfg["base_url"], cfg["model_name"])
+
+
+def _bind_tools(llm: ChatOpenAI):
+    """复用 bind_tools 生成的工具 schema，避免每轮调用重复构造。"""
+    key = id(llm)
+    cached = _bound_llms.get(key)
+    if cached and cached[0] is llm:
+        return cached[1]
+    with _bound_llms_lock:
+        cached = _bound_llms.get(key)
+        if cached and cached[0] is llm:
+            return cached[1]
+        bound = llm.bind_tools(_tools)
+        _bound_llms[key] = (llm, bound)
+        return bound
+
+
+def _get_writer(config: RunnableConfig | None = None):
+    """获取 LangGraph custom stream writer，并兼容旧版本的私有注入方式。"""
+    if get_stream_writer is not None:
+        try:
+            return get_stream_writer()
+        except (RuntimeError, LookupError):
+            pass
+    if config:
+        return config.get("configurable", {}).get("__pregel_stream_writer")
+    return None
+
+
+def _write_progress(writer, stage: str, content: str) -> None:
+    if writer is not None:
+        writer({"type": "progress", "stage": stage, "content": content})
 
 
 def _parse_dsml_tool_calls(content: str) -> list[tuple[str, dict]]:
@@ -81,22 +134,19 @@ def _invoke_with_tools(llm: ChatOpenAI, messages: list, max_rounds: int = 8,
     最终响应（无工具调用）的 tokens 通过 stream_writer 逐个发送。
     未传入时行为与原来完全一致（invoke）。
     """
-    tools = create_tools()
-    tool_map = {t.name: t for t in tools}
-    llm_with_tools = llm.bind_tools(tools)
+    tool_map = {t.name: t for t in _tools}
+    llm_with_tools = _bind_tools(llm)
 
     for _ in range(max_rounds):
         if stream_writer is not None:
             # 流式模式：用 stream() 逐 chunk 获取，有内容立即推送给前端
             full = None
-            tokens = []
             for chunk in llm_with_tools.stream(messages):
                 if full is None:
                     full = chunk
                 else:
                     full += chunk
                 if chunk.content:
-                    tokens.append(chunk.content)
                     # 立即推送每个 token，实现逐字流式效果
                     stream_writer({"type": "token", "content": chunk.content})
             if full is None:
@@ -162,8 +212,8 @@ def _extract_first_question(content: str) -> str:
     """LLM 违规一次输出多个问题时，只截取第一个问题。
     LLM 违规直接输出设计方案 JSON 时，返回友好提示。
 
-    识别"第二个问题"的标记：行首的 `### 问题`、`问题N`、`Q N` 等。
-    只有一个问题或无标记时原样返回。
+    识别行首的问题编号标记；系统会在 SSE 层统一加上正确编号，因此模型
+    输出中的第一个编号也必须移除。
     """
     if not content:
         return content
@@ -189,11 +239,22 @@ def _extract_first_question(content: str) -> str:
             return before_code
         return "信息已足够，我将为您生成设计方案。"
 
-    # 匹配行首的问题标记（第二个及以后）
-    marks = list(re.finditer(r'(?:^|\n)\s*(?:#{1,4}\s*)?(?:问题|Q)\s*\d+\s*[：:]', content))
+    # 先截断第二个问题，再移除模型自带的第一个编号。即使模型
+    # 只输出了一个错误编号（如系统当前是 Q2，模型却写 Q3）也能归一化。
+    marker_pattern = r'(?m)^[ \t]*(?:#{1,4}[ \t]*)?(?:问题|Q)[ \t]*\d+[ \t]*[：:][ \t]*'
+    marks = list(re.finditer(marker_pattern, content))
     if len(marks) >= 2:
-        return content[:marks[1].start()].rstrip()
-    return content
+        content = content[:marks[1].start()].rstrip()
+    return re.sub(marker_pattern, '', content, count=1).strip()
+
+
+def _is_explicit_design_confirmation(feedback: str) -> bool:
+    """只匹配无歧义的短确认，含修改内容的回复仍交给 LLM 分类。"""
+    normalized = re.sub(r"[\s，,。.!！?？]", "", feedback).lower()
+    return normalized in {
+        "确认", "确认请开始生成存储过程", "确认方案开始生成", "开始生成",
+        "可以", "好的", "好", "没问题", "同意", "继续", "生成", "ok", "yes",
+    }
 
 
 def _classify_design_feedback(llm: ChatOpenAI, design: str, feedback: str) -> tuple[str, str, str]:
@@ -216,10 +277,11 @@ def _classify_design_feedback(llm: ChatOpenAI, design: str, feedback: str) -> tu
     return "IRRELEVANT", "无法理解您的反馈，请确认方案或提出修改意见。", ""
 
 
-def clarify_node(state: AgentState, config: dict = None) -> dict:
+def clarify_node(state: AgentState, config: RunnableConfig | None = None) -> dict:
     """需求确认节点 — 系统控制编号，最多 5 个问题，可提前结束。"""
     llm = _get_llm()
-    stream_writer = config.get("configurable", {}).get("__pregel_stream_writer") if config else None
+    stream_writer = _get_writer(config)
+    _write_progress(stream_writer, "clarify", "正在分析需求并准备下一个关键问题...")
 
     # 如果 mode 已经跳过了需求确认阶段，直接 pass-through
     current_mode = state.get("mode", "clarify")
@@ -270,9 +332,9 @@ def clarify_node(state: AgentState, config: dict = None) -> dict:
         last_question_hint=last_question_hint,
     )
     messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=prompt)]
-    # 注意：clarify 阶段不使用 stream_writer，避免 LLM 不规范输出（如 JSON 设计方案）
-    # 被提前推送到前端。最终问题通过 interrupt 事件发送。
-    response = _invoke_with_tools(llm, messages, max_rounds=1)
+    # 澄清只判断业务需求，不做 schema 探测；避免携带工具 schema 及误触发后的
+    # 第二次模型往返。最终问题通过 interrupt 事件发送。
+    response = llm.invoke(messages)
 
     if "INFO_SUFFICIENT" in response.content:
         return {
@@ -316,8 +378,10 @@ def clarify_node(state: AgentState, config: dict = None) -> dict:
     }
 
 
-def assumptions_node(state: AgentState, config: dict = None) -> dict:
+def assumptions_node(state: AgentState, config: RunnableConfig | None = None) -> dict:
     """关键项确认节点 — LLM 生成关键假设列表，用户逐项确认/修改后进入设计。"""
+    stream_writer = _get_writer(config)
+    _write_progress(stream_writer, "assumptions", "正在整理需要确认的关键项...")
     llm = _get_llm()
 
     # 如果 mode 已跳过，直接 pass-through
@@ -386,10 +450,10 @@ def assumptions_node(state: AgentState, config: dict = None) -> dict:
     }
 
 
-def design_node(state: AgentState, config: dict = None) -> dict:
+def design_node(state: AgentState, config: RunnableConfig | None = None) -> dict:
     """方案设计节点 — 基于需求生成方案，支持多轮反馈确认。"""
     llm = _get_llm()
-    stream_writer = config.get("configurable", {}).get("__pregel_stream_writer") if config else None
+    stream_writer = _get_writer(config)
     design_phase = state.get("design_phase")
     design = state.get("design", "")
 
@@ -401,6 +465,15 @@ def design_node(state: AgentState, config: dict = None) -> dict:
             content = f"{reply}\n\n{content}"
 
         decision = interrupt({"type": "design", "content": content, "phase": "feedback"})
+        if isinstance(decision, dict) and decision.get("action") == "confirm":
+            return {
+                "design": design,
+                "mode": "generate",
+                "status": "designed",
+                "design_phase": None,
+                "last_feedback_reply": "",
+            }
+
 
         if isinstance(decision, dict) and decision.get("action") == "modify":
             design = decision.get("design", design)
@@ -413,6 +486,14 @@ def design_node(state: AgentState, config: dict = None) -> dict:
             }
 
         if isinstance(decision, str) and decision.strip():
+            if _is_explicit_design_confirmation(decision):
+                return {
+                    "design": design,
+                    "mode": "generate",
+                    "status": "designed",
+                    "design_phase": None,
+                    "last_feedback_reply": "",
+                }
             intent, reply2, new_design = _classify_design_feedback(llm, design, decision.strip())
             if intent == "CONFIRM":
                 return {
@@ -464,6 +545,15 @@ def design_node(state: AgentState, config: dict = None) -> dict:
         design = response.content
 
     decision = interrupt({"type": "design", "content": design, "phase": "new"})
+    if isinstance(decision, dict) and decision.get("action") == "confirm":
+        return {
+            "design": design,
+            "mode": "generate",
+            "status": "designed",
+            "design_phase": None,
+            "last_feedback_reply": "",
+        }
+
 
     # dict 修改（前端手动修改推送）
     if isinstance(decision, dict) and decision.get("action") == "modify":
@@ -477,6 +567,14 @@ def design_node(state: AgentState, config: dict = None) -> dict:
 
     # 文本反馈分类
     if isinstance(decision, str) and decision.strip():
+        if _is_explicit_design_confirmation(decision):
+            return {
+                "design": design,
+                "mode": "generate",
+                "status": "designed",
+                "design_phase": None,
+                "last_feedback_reply": "",
+            }
         intent, reply, new_design = _classify_design_feedback(llm, design, decision.strip())
         if intent == "CONFIRM":
             return {
@@ -669,7 +767,8 @@ def _generate_verify_sql_for_sp(llm: ChatOpenAI, sp_row: dict, design: str, veri
         verify_logic=verify_logic_text or "无（请根据SP代码自行设计校验逻辑）",
     )
     vq_messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=vq_prompt)]
-    vq_response = _invoke_with_tools(llm, vq_messages, max_rounds=3)
+    # 校验 SQL 严格派生自已确认的设计和 SP 代码，无需再次做 schema 探测。
+    vq_response = llm.invoke(vq_messages)
     vq_data = _parse_json(vq_response.content)
 
     if vq_data:
@@ -703,18 +802,22 @@ def _generate_verify_sql_for_sp(llm: ChatOpenAI, sp_row: dict, design: str, veri
     return sp_row
 
 
-def generate_node(state: AgentState, config: dict = None) -> dict:
+def generate_node(state: AgentState, config: RunnableConfig | None = None) -> dict:
     """代码生成节点 — 两阶段：先生成 SP，再为每个 SP 单独生成校验 SQL。"""
     from app.db.sqlite import delete_sps_except
 
     llm = _get_llm()
+    stream_writer = _get_writer(config)
+    _write_progress(stream_writer, "generate", "正在生成存储过程代码...")
     session_id = state["session_id"]
     design = state["design"]
 
     # === 阶段 1：生成存储过程代码 ===
     prompt = GENERATE_PROMPT.format(design=design)
     messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=prompt)]
-    response = _invoke_with_tools(llm, messages, max_rounds=8)
+    # 表结构不确定性应在设计阶段解决；生成阶段保持单次结构化调用，避免模型
+    # 陷入工具循环（旧实现最坏会产生 8 次工具轮次 + 1 次收尾调用）。
+    response = llm.invoke(messages)
     data = _parse_json(response.content)
     print(f"[DEBUG generate_node] parsed={'OK' if data else 'FAIL'}, procedures={len(data.get('procedures',[])) if data else 0}", flush=True)
 
@@ -737,6 +840,10 @@ def generate_node(state: AgentState, config: dict = None) -> dict:
         sp = save_sp(session_id, proc["name"], code)
         sp_row = dict(sp) if not isinstance(sp, dict) else sp
         sp_list.append(sp_row)
+    _write_progress(
+        stream_writer, "verify_sql",
+        f"已生成 {len(sp_list)} 个存储过程，正在并行设计校验 SQL...",
+    )
     # === 阶段 2：并行生成校验 SQL ===
     # 注意：旧 SP 暂不删除，等阶段 2 全部完成后统一替换，
     # 避免校验 SQL 生成中途出错导致旧 SP 已丢、新 SP 不完整
@@ -753,12 +860,17 @@ def generate_node(state: AgentState, config: dict = None) -> dict:
             ): sp_row
             for sp_row in sp_list
         }
+        completed = 0
         for future in as_completed(futures):
             sp_row = futures[future]
             try:
                 future.result()
             except Exception as e:
                 print(f"[ERROR] 校验 SQL 生成失败: {sp_row.get('name')}: {e}", flush=True)
+            completed += 1
+            _write_progress(
+                stream_writer, "verify_sql", f"校验 SQL 进度：{completed}/{len(futures)}",
+            )
 
     # 新 SP 全部就绪（代码 + 参数 + 校验 SQL），现在替换旧 SP
     delete_sps_except(session_id, [s["id"] for s in sp_list])
@@ -770,11 +882,13 @@ def generate_node(state: AgentState, config: dict = None) -> dict:
     }
 
 
-def verify_node(state: AgentState, config: dict = None) -> dict:
+def verify_node(state: AgentState, config: RunnableConfig | None = None) -> dict:
     """校验节点 — 语法+业务校验，失败时自动修复（最多 2 次迭代）。"""
     from app.db.sqlite import get_verify_queries, get_sps, update_sp as db_update_sp, update_verify_query
 
     llm = _get_llm()
+    stream_writer = _get_writer(config)
+    _write_progress(stream_writer, "verify", "正在执行语法与业务数据校验...")
 
     sp_list = state.get("sp_list", [])
     # 回退：如果状态中 sp_list 为空，从数据库加载
@@ -834,6 +948,7 @@ def verify_node(state: AgentState, config: dict = None) -> dict:
                     sp_exec_error = str(e)
 
             biz_all_ok = True
+            verify_sql_errors = []
             biz_errors = []
             for vq in vqs:
                 try:
@@ -866,7 +981,14 @@ def verify_node(state: AgentState, config: dict = None) -> dict:
                                         result_detail=json.dumps(result_detail, ensure_ascii=False, indent=2))
                 except Exception as e:
                     biz_all_ok = False
-                    biz_errors.append({"query": vq["name"], "error": str(e)})
+                    error_text = str(e)
+                    verify_sql_errors.append({
+                        "query_id": vq["id"],
+                        "query": vq["name"],
+                        "sql_code": vq["sql_code"],
+                        "error": error_text,
+                    })
+                    biz_errors.append({"query": vq["name"], "error": error_text})
                     update_verify_query(vq["id"], status="fail", result_detail=str(e))
 
             # 全部通过 → 跳出修复循环
@@ -889,12 +1011,35 @@ def verify_node(state: AgentState, config: dict = None) -> dict:
                 all_pass = False
                 break
 
-            # === 告知用户进度（interrupt 让 chat.py 向用户发送 SSE）===
-            interrupt({
-                "type": "auto_fix_progress",
-                "message": f"校验失败，正在自动修正（第 {fix_round + 1}/{MAX_FIX_ROUNDS} 次）...",
-                "sp_name": sp.get("name", ""),
-            })
+            # 校验 SQL 自身执行失败时先修复校验 SQL，不能把错误归因于 SP。
+            if verify_sql_errors:
+                _write_progress(
+                    stream_writer, "auto_fix",
+                    f"校验 SQL 执行失败，正在自动修正（第 {fix_round + 1}/{MAX_FIX_ROUNDS} 次）...",
+                )
+                for item in verify_sql_errors:
+                    prompt = FIX_VERIFY_SQL_PROMPT.format(
+                        query_name=item["query"],
+                        sql_code=item["sql_code"],
+                        error=item["error"],
+                    )
+                    response = llm.invoke([
+                        SystemMessage(content=SYSTEM_PROMPT),
+                        HumanMessage(content=prompt),
+                    ])
+                    fixed = _parse_json(response.content)
+                    if fixed and fixed.get("fixed_sql"):
+                        update_verify_query(
+                            item["query_id"], sql_code=fixed["fixed_sql"],
+                            status="pending", result_detail="",
+                        )
+                continue
+
+            # 进度通知不应暂停整张图；custom stream 可直接推送给 SSE。
+            _write_progress(
+                stream_writer, "auto_fix",
+                f"校验失败，正在自动修正（第 {fix_round + 1}/{MAX_FIX_ROUNDS} 次）...",
+            )
 
             # === 调用 LLM 修复代码 ===
             errors_text = []
@@ -909,7 +1054,8 @@ def verify_node(state: AgentState, config: dict = None) -> dict:
                 errors="\n".join(errors_text),
             )
             fix_messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=fix_prompt)]
-            fix_response = _invoke_with_tools(llm, fix_messages, max_rounds=2)
+            # 修复阶段只需结构化改写，不携带工具，避免无关工具循环拖长请求。
+            fix_response = llm.invoke(fix_messages)
             fix_data = _parse_json(fix_response.content)
 
             if fix_data and fix_data.get("fixed_code"):
@@ -929,7 +1075,7 @@ def verify_node(state: AgentState, config: dict = None) -> dict:
     }
 
 
-def deploy_check_node(state: AgentState, config: dict = None) -> dict:
+def deploy_check_node(state: AgentState, config: RunnableConfig | None = None) -> dict:
     """部署预检节点 — 最终校验所有 SP。"""
     all_pass = True
     results = []
@@ -945,7 +1091,7 @@ def deploy_check_node(state: AgentState, config: dict = None) -> dict:
     return {"status": "ready_to_deploy", "precheck_results": results}
 
 
-def deploy_node(state: AgentState, config: dict = None) -> dict:
+def deploy_node(state: AgentState, config: RunnableConfig | None = None) -> dict:
     """部署节点 — 执行 CREATE PROCEDURE。"""
     from app.db.sqlite import update_sp as db_update_sp
     import datetime

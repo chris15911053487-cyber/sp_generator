@@ -36,7 +36,7 @@ def _after_design(state: AgentState) -> str:
     return "generate"
 
 
-def create_graph() -> StateGraph:
+def _compile_graph() -> StateGraph:
     builder = StateGraph(AgentState)
 
     builder.add_node("clarify", clarify_node)
@@ -69,3 +69,13 @@ def create_graph() -> StateGraph:
     builder.add_edge("deploy", END)
 
     return builder.compile(checkpointer=_memory)
+
+
+# 图结构和 checkpointer 都是进程级资源。编译结果是线程安全的，且会话隔离由
+# configurable.thread_id 保证；不要在每个 SSE 请求里重复构建整张图。
+_graph = _compile_graph()
+
+
+def create_graph() -> StateGraph:
+    """返回进程级已编译图（保留原函数名，避免影响现有调用方）。"""
+    return _graph

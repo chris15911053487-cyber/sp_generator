@@ -1,12 +1,14 @@
 """对话路由 — SSE 流式对话，驱动 Agent 状态图。"""
+import asyncio
 import json
 from fastapi import APIRouter
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from app.db.sqlite import save_message, get_messages
 from app.agent.graph import create_graph
-from langgraph.types import Command, interrupt
+from langgraph.types import Command
 
+_graph = create_graph()
 router = APIRouter(prefix="/api/chat", tags=["chat"])
 
 
@@ -14,6 +16,15 @@ class ChatRequest(BaseModel):
     session_id: str
     message: str
     action: str = "send"
+
+def _wants_to_skip_clarify(message: str) -> bool:
+    """识别前端明确的“跳过澄清”快捷操作，不猜测普通自然语言。"""
+    normalized = "".join(message.lower().split()).strip("，,。.!！?？")
+    return normalized in {
+        "不需要再问了，请直接生成设计方案",
+        "跳过澄清，直接设计",
+        "跳过确认，直接设计",
+    }
 
 
 def _has_interrupt(state) -> bool:
@@ -36,20 +47,29 @@ def _get_interrupt_value(state):
     return None
 
 
+async def _get_graph_state(config):
+    """避免同步状态读取阻塞 FastAPI 的事件循环。"""
+    async_get_state = getattr(_graph, "aget_state", None)
+    if async_get_state is not None:
+        return await async_get_state(config)
+    return await asyncio.to_thread(_graph.get_state, config)
+
+
 @router.post("/stream")
 async def api_chat_stream(req: ChatRequest):
     """SSE 流式对话端点。"""
-    save_message(req.session_id, "user", req.message)
-
     async def event_stream():
-        graph = create_graph()
+        graph = _graph
         config = {"configurable": {"thread_id": req.session_id}}
 
         try:
-            state = graph.get_state(config)
+            # 立即返回首个事件，让浏览器不再无反馈地等待 LLM/数据库。
+            yield f"data: {json.dumps({'type': 'progress', 'stage': 'accepted', 'content': '已收到，正在分析...'})}\n\n"
+            await asyncio.to_thread(save_message, req.session_id, "user", req.message)
+            state = await _get_graph_state(config)
 
             # 检测用户消息数（用于强制退出澄清阶段）
-            all_msgs = get_messages(req.session_id)
+            all_msgs = await asyncio.to_thread(get_messages, req.session_id)
             user_count = sum(1 for m in all_msgs if m["role"] == "user")
 
             # 判断是否处于中断等待状态
@@ -58,7 +78,7 @@ async def api_chat_stream(req: ChatRequest):
                 itype = interrupt_val.get("type", "") if isinstance(interrupt_val, dict) else ""
 
                 # 如果澄清阶段超过 4 条用户消息，强制进入关键项确认阶段
-                if itype == "clarify" and user_count >= 6:
+                if itype == "clarify" and (user_count >= 6 or _wants_to_skip_clarify(req.message)):
                     # 跳过需求确认，直接用 mode=assumptions 重启 graph
                     requirements = state.values.get("requirements", "") if state.values else ""
                     new_input = {
@@ -77,6 +97,13 @@ async def api_chat_stream(req: ChatRequest):
                         "last_feedback_reply": state.values.get("last_feedback_reply", "") if state.values else "",
                     }
                     events = graph.astream(new_input, config, stream_mode=["updates", "custom"])
+                elif itype == "design" and req.action == "confirm_design":
+                    # 快捷确认按钮使用结构化动作，避免让 LLM 猜测固定按钮文案的意图。
+                    events = graph.astream(
+                        Command(resume={"action": "confirm"}),
+                        config,
+                        stream_mode=["updates", "custom"],
+                    )
                 else:
                     events = graph.astream(Command(resume=req.message), config, stream_mode=["updates", "custom"])
             elif state and state.values:
@@ -145,13 +172,14 @@ async def api_chat_stream(req: ChatRequest):
                 events = graph.astream(input_state, config, stream_mode=["updates", "custom"])
 
             assistant_response = ""
+            assistant_saved = False
             generate_failed = False  # generate 失败时不再用 verify 结果覆盖，避免"校验全对但右侧旧SP"误导
 
             async def _handle_event():
                 """处理单个事件流，返回是否需要继续处理后续中断（auto_fix 场景）。
                 注意：用 nonlocal 修改外层 assistant_response 和 generate_failed。
                 """
-                nonlocal assistant_response, generate_failed
+                nonlocal assistant_response, assistant_saved, generate_failed
 
                 async for mode, data in events:
                     if mode == "custom":
@@ -206,6 +234,11 @@ async def api_chat_stream(req: ChatRequest):
                                 else:
                                     lines.append("⚠️ 校验结果为空，可能未生成存储过程")
                                 assistant_response = "\n".join(lines)
+                                # 先持久化最终状态再推送 SSE；客户端此时断开也能在刷新后恢复结果。
+                                await asyncio.to_thread(
+                                    save_message, req.session_id, "assistant", assistant_response,
+                                )
+                                assistant_saved = True
                                 yield f"data: {json.dumps({'type': 'verify_result', 'content': assistant_response, 'data': node_output})}\n\n"
 
                             yield f"data: {json.dumps({'node': node_name, 'data': node_output, 'type': 'update'})}\n\n"
@@ -216,7 +249,7 @@ async def api_chat_stream(req: ChatRequest):
 
             # 自动修复 / 中断循环
             while True:
-                new_state = graph.get_state(config)
+                new_state = await _get_graph_state(config)
                 if not new_state or not _has_interrupt(new_state):
                     break
 
@@ -271,19 +304,20 @@ async def api_chat_stream(req: ChatRequest):
             if not assistant_response:
                 assistant_response = "处理完成"
 
-            save_message(req.session_id, "assistant", assistant_response)
+            if not assistant_saved:
+                await asyncio.to_thread(save_message, req.session_id, "assistant", assistant_response)
             yield f"data: {json.dumps({'type': 'done', 'content': assistant_response})}\n\n"
 
         except Exception as e:
             error_msg = f"处理出错: {str(e)}"
-            save_message(req.session_id, "assistant", error_msg)
+            await asyncio.to_thread(save_message, req.session_id, "assistant", error_msg)
             yield f"data: {json.dumps({'type': 'error', 'content': error_msg})}\n\n"
 
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-transform",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         },

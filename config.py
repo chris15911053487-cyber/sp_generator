@@ -78,8 +78,17 @@ def get_db_config() -> dict:
 
 
 def get_llm_config() -> dict:
+    # 一次连接读取完整配置。旧实现会为一次 LLM 调用打开三次 SQLite 连接，
+    # Agent 的多节点/多轮工具调用会把这类固定开销反复放大。
+    conn = _get_conn()
+    rows = conn.execute(
+        "SELECT key, value FROM config WHERE key IN (?, ?, ?)",
+        ("llm_api_key", "llm_base_url", "llm_model_name"),
+    ).fetchall()
+    conn.close()
+    values = dict(rows)
     return {
-        "api_key": get_config("llm_api_key"),
-        "base_url": get_config("llm_base_url"),
-        "model_name": get_config("llm_model_name"),
+        "api_key": values.get("llm_api_key", DEFAULT_CONFIG["llm_api_key"]),
+        "base_url": values.get("llm_base_url", DEFAULT_CONFIG["llm_base_url"]),
+        "model_name": values.get("llm_model_name", DEFAULT_CONFIG["llm_model_name"]),
     }

@@ -499,14 +499,38 @@
         const r = await fetch('/api/chat/stream', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({session_id: currentSessionId, message: message}),
+            body: JSON.stringify({
+                session_id: currentSessionId,
+                message: message,
+                action: input.dataset.action || 'send',
+            }),
         });
+        delete input.dataset.action;
 
         const reader = r.body.getReader();
         currentReader = reader;
         const decoder = new TextDecoder();
         let buffer = '';
         let assistantText = '';
+        let tokenRenderTimer = null;
+        let lastEventType = '';
+
+        function cancelTokenRender() {
+            if (tokenRenderTimer !== null) {
+                clearTimeout(tokenRenderTimer);
+                tokenRenderTimer = null;
+            }
+        }
+
+        function scheduleTokenRender() {
+            if (tokenRenderTimer !== null) return;
+            tokenRenderTimer = setTimeout(function() {
+                tokenRenderTimer = null;
+                assistantDiv.style.whiteSpace = 'pre-wrap';
+                assistantDiv.textContent = assistantText;
+                container.scrollTop = container.scrollHeight;
+            }, 50);
+        }
 
         while (true) {
             const {done, value} = await reader.read();
@@ -519,11 +543,18 @@
                 try {
                     const data = JSON.parse(line.slice(6));
 
+                    if (data.type !== 'token' && data.type !== 'update' && data.type !== 'done') {
+                        cancelTokenRender();
+                        lastEventType = data.type;
+                        assistantDiv.style.whiteSpace = '';
+                    }
                     if (data.type === 'token') {
-                        // 流式 token：逐字追加渲染
+                        // 合并高频 token，避免每个 token 都全量 Markdown 解析和重建 DOM。
                         assistantText += data.content;
-                        assistantDiv.innerHTML = renderMarkdown(assistantText);
-                        container.scrollTop = container.scrollHeight;
+                        lastEventType = 'token';
+                        scheduleTokenRender();
+                    } else if (data.type === 'progress') {
+                        assistantDiv.innerHTML = '<em style="color:#6c5ce7;">⏳ ' + escapeHtml(data.content) + '</em>';
                     } else if (data.type === 'question') {
                         assistantText = data.content;
                         assistantDiv.innerHTML = renderMarkdown(data.content)
@@ -537,7 +568,7 @@
                         assistantText = data.content;
                         assistantDiv.innerHTML = '<div class="design-block"><div class="design-header">📋 设计方案</div><div class="design-content">' + renderDesignContent(data.content) + '</div><div class="design-hint">👆 请确认方案，或回复修改意见</div></div>'
                             + renderQuickActions([
-                                {label: '✅ 确认方案，开始生成', text: '确认，请开始生成存储过程', style: 'primary'},
+                                {label: '✅ 确认方案，开始生成', text: '确认，请开始生成存储过程', action: 'confirm_design', style: 'primary'},
                                 {label: '🔄 重新设计', text: '请重新设计方案', style: 'secondary'},
                             ]);
                     } else if (data.type === 'auto_fix_progress') {
@@ -592,6 +623,16 @@
             container.scrollTop = container.scrollHeight;
         }
 
+        cancelTokenRender();
+        if (lastEventType === 'token') {
+            assistantDiv.style.whiteSpace = '';
+            assistantDiv.innerHTML = renderMarkdown(assistantText);
+        }
+        if (lastEventType === 'progress' || lastEventType === 'auto_fix_progress') {
+            assistantDiv.className = 'message assistant stopped';
+            assistantDiv.innerHTML = '流式连接已结束，请刷新当前会话查看最终校验状态。';
+            loadSpList();
+        }
         if (!assistantText && assistantDiv.textContent === '思考中...') {
             assistantDiv.textContent = '处理完成';
         }
@@ -618,7 +659,7 @@
             if (a.action === 'deploy') {
                 html += `<button class="quick-btn ${a.style}" onclick="quickDeploy(this)">${a.label}</button>`;
             } else {
-                html += `<button class="quick-btn ${a.style}" onclick="quickSend(this, '${escapeHtml(a.text)}')">${a.label}</button>`;
+                html += `<button class="quick-btn ${a.style}" onclick="quickSend(this, '${escapeHtml(a.text)}', '${escapeHtml(a.action || 'send')}')">${a.label}</button>`;
             }
         }
         html += '</div>';
@@ -778,12 +819,14 @@
         document.getElementById('chat-form').dispatchEvent(new Event('submit', {cancelable: true}));
     }
 
-    function quickSend(btn, text) {
+    function quickSend(btn, text, action = 'send') {
         // 移除所有快捷按钮（避免重复点击）
         const actionsDiv = btn.closest('.quick-actions');
         if (actionsDiv) actionsDiv.remove();
         // 填入输入框并发送
-        document.getElementById('chat-input').value = text;
+        const input = document.getElementById('chat-input');
+        input.value = text;
+        input.dataset.action = action;
         document.getElementById('chat-form').dispatchEvent(new Event('submit', {cancelable: true}));
     }
 
