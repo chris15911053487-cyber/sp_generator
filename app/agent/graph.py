@@ -61,7 +61,7 @@ def _compile_graph() -> StateGraph:
         "plan": "plan",
         "generate": "generate",
     })
-    builder.add_edge("generate", END)
+    builder.add_edge("generate", "verify")
     builder.add_edge("verify", END)
 
     return builder.compile(checkpointer=_memory)

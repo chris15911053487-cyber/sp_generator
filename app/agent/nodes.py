@@ -925,7 +925,9 @@ def generate_node(state: AgentState, config: RunnableConfig | None = None) -> di
 
 def verify_node(state: AgentState, config: RunnableConfig | None = None) -> dict:
     """统一校验节点：临时执行 SP，不部署、不自动修改代码。"""
-    from app.db.sqlite import get_sps, get_verify_queries, update_sp as db_update_sp
+    from app.db.sqlite import (
+        get_sps, get_verify_queries, update_sp as db_update_sp, update_verify_query,
+    )
     from app.services.validation import validate_sp_bundle
 
     stream_writer = _get_writer(config)
@@ -952,6 +954,12 @@ def verify_node(state: AgentState, config: RunnableConfig | None = None) -> dict
         except (TypeError, json.JSONDecodeError):
             pass
         result = validate_sp_bundle(current, queries, params)
+        if any(
+            detail.get("type") == "execution"
+            for detail in result.get("details", [])
+        ):
+            _write_progress(stream_writer, "verify", "校验执行异常，正在重试（1/1）...")
+            result = validate_sp_bundle(current, queries, params)
         passed = result["syntax_ok"] and result["business_ok"]
         status = "verify_failed"
         if passed:
@@ -969,6 +977,27 @@ def verify_node(state: AgentState, config: RunnableConfig | None = None) -> dict
             verify_result=json.dumps(result, ensure_ascii=False),
             validated_hash=result["bundle_hash"] if passed else None,
         )
+        detail_by_id = {
+            detail.get("query_id"): detail
+            for detail in result.get("details", []) if detail.get("query_id")
+        }
+        global_failure = next(
+            (
+                detail for detail in result.get("details", [])
+                if not detail.get("pass", False) and not detail.get("query_id")
+            ),
+            None,
+        )
+        for query in queries:
+            query_id = query.get("id")
+            detail = detail_by_id.get(query_id) or global_failure
+            if not query_id or detail is None:
+                continue
+            update_verify_query(
+                query_id,
+                status="pass" if detail.get("pass") else "fail",
+                result_detail=json.dumps(detail, ensure_ascii=False, indent=2),
+            )
         results.append(result)
         all_pass = all_pass and passed
 

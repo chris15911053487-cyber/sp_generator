@@ -13,6 +13,7 @@ def test_verify_node_uses_unified_validation_without_deployment(monkeypatch):
     }
     queries = [{"id": "vq-1", "name": "校验", "sql_code": "SELECT 1"}]
     updates = []
+    query_updates = []
     calls = []
 
     monkeypatch.setattr(nodes, "_get_writer", lambda _config=None: None)
@@ -21,13 +22,20 @@ def test_verify_node_uses_unified_validation_without_deployment(monkeypatch):
     monkeypatch.setattr(
         sqlite_db, "update_sp", lambda _sp_id, **changes: updates.append(changes),
     )
+    monkeypatch.setattr(
+        sqlite_db, "update_verify_query",
+        lambda query_id, **changes: query_updates.append((query_id, changes)),
+    )
 
     def validate(candidate, candidate_queries, params):
         calls.append((candidate, candidate_queries, params))
         return {
             "sp_id": candidate["id"], "sp_name": candidate["name"],
             "syntax_ok": True, "business_ok": True, "bundle_hash": "hash-1",
-            "details": [],
+            "details": [{
+                "type": "business", "query_id": "vq-1", "query": "校验",
+                "pass": True, "comparison": {"summary": "结果一致"},
+            }],
         }
 
     monkeypatch.setattr(validation, "validate_sp_bundle", validate)
@@ -38,7 +46,54 @@ def test_verify_node_uses_unified_validation_without_deployment(monkeypatch):
     assert len(calls) == 1
     assert updates[-1]["validated_hash"] == "hash-1"
     assert updates[-1]["status"] == "verified"
+    assert query_updates[-1][1]["status"] == "pass"
     assert "code" not in updates[-1]
+
+
+def test_verify_node_retries_execution_failure_once(monkeypatch):
+    sp = {
+        "id": "sp-1", "name": "sp_Test", "code": "CREATE PROCEDURE sp_Test AS SELECT 1",
+        "parameters": "[]", "operation_type": "query",
+    }
+    queries = [{"id": "vq-1", "name": "校验", "sql_code": "SELECT 1"}]
+    attempts = []
+
+    monkeypatch.setattr(nodes, "_get_writer", lambda _config=None: None)
+    monkeypatch.setattr(sqlite_db, "get_sps", lambda _session_id: [dict(sp)])
+    monkeypatch.setattr(sqlite_db, "get_verify_queries", lambda _sp_id: queries)
+    monkeypatch.setattr(sqlite_db, "update_sp", lambda *_args, **_kwargs: None)
+
+    def validate(candidate, _queries, _params):
+        attempts.append(candidate["id"])
+        if len(attempts) == 1:
+            return {
+                "sp_id": candidate["id"], "sp_name": candidate["name"],
+                "syntax_ok": True, "business_ok": False, "bundle_hash": "hash-1",
+                "details": [{"type": "execution", "pass": False, "error": "temporary"}],
+            }
+        return {
+            "sp_id": candidate["id"], "sp_name": candidate["name"],
+            "syntax_ok": True, "business_ok": True, "bundle_hash": "hash-1",
+            "details": [],
+        }
+
+    monkeypatch.setattr(validation, "validate_sp_bundle", validate)
+
+    result = nodes.verify_node({"session_id": "session-1", "sp_list": [sp]})
+
+    assert len(attempts) == 2
+    assert result["status"] == "verified"
+
+
+def test_generate_flows_to_verify_node():
+    from app.agent.graph import create_graph
+
+    edges = create_graph().get_graph().edges
+
+    assert any(
+        edge.source == "generate" and edge.target == "verify"
+        for edge in edges
+    )
 
 
 def test_generate_keeps_old_artifacts_when_verify_sql_generation_fails(monkeypatch):

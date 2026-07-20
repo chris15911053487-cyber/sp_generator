@@ -228,9 +228,16 @@ async def api_chat_stream(req: ChatRequest):
                                                 lines.append(f"   语法错误: {d.get('error', '')[:120]}")
                                             elif d.get("type") == "business":
                                                 mark = "✅" if d.get("pass") else "❌"
-                                                detail = d.get('data', d.get('error', ''))
+                                                comparison = d.get("comparison") or {}
+                                                detail = comparison.get("summary") or d.get("error") or d.get("data", "")
                                                 detail_str = str(detail)[:120] if detail else ''
                                                 lines.append(f"   {mark} {d.get('query', '')}: {detail_str}")
+                                            elif not d.get("pass") and d.get("error"):
+                                                label = {
+                                                    "safety": "安全检查", "execution": "执行错误",
+                                                    "rollback": "回滚检查",
+                                                }.get(d.get("type"), "校验错误")
+                                                lines.append(f"   ❌ {label}: {d['error'][:120]}")
                                 else:
                                     lines.append("⚠️ 校验结果为空，可能未生成存储过程")
                                 assistant_response = "\n".join(lines)

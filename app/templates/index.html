@@ -516,6 +516,7 @@
         let assistantText = '';
         let tokenRenderTimer = null;
         let lastEventType = '';
+        let terminalEventReceived = false;
 
         function cancelTokenRender() {
             if (tokenRenderTimer !== null) {
@@ -544,6 +545,10 @@
                 if (!line.startsWith('data: ')) continue;
                 try {
                     const data = JSON.parse(line.slice(6));
+
+                    if (data.type === 'done' || data.type === 'verify_result' || data.type === 'error') {
+                        terminalEventReceived = true;
+                    }
 
                     if (data.type !== 'token' && data.type !== 'update' && data.type !== 'done') {
                         cancelTokenRender();
@@ -630,7 +635,8 @@
             assistantDiv.style.whiteSpace = '';
             assistantDiv.innerHTML = renderMarkdown(assistantText);
         }
-        if (lastEventType === 'progress' || lastEventType === 'auto_fix_progress') {
+        if (!terminalEventReceived &&
+                (lastEventType === 'progress' || lastEventType === 'auto_fix_progress')) {
             assistantDiv.className = 'message assistant stopped';
             assistantDiv.innerHTML = '流式连接已结束，请刷新当前会话查看最终校验状态。';
             loadSpList();
@@ -857,8 +863,15 @@
                             html += `<div class="vcd-row fail">❌ 语法错误: ${escapeHtml((d.error||'').substring(0,150))}</div>`;
                         } else if (d.type === 'business') {
                             const mark = d.pass ? '✅' : '❌';
-                            const detail = d.data ? ('数据: ' + escapeHtml(JSON.stringify(d.data).substring(0,100))) : (d.error ? escapeHtml(String(d.error).substring(0,150)) : '');
+                            const summary = d.comparison && d.comparison.summary;
+                            const detail = summary ? escapeHtml(String(summary).substring(0,150)) : (d.data ? ('数据: ' + escapeHtml(JSON.stringify(d.data).substring(0,100))) : (d.error ? escapeHtml(String(d.error).substring(0,150)) : ''));
                             html += `<div class="vcd-row ${d.pass?'pass':'fail'}">${mark} ${escapeHtml(d.query||'')}: ${detail}</div>`;
+                        } else if (!d.pass && d.error) {
+                            const labels = {
+                                safety: '安全检查', execution: '执行错误', rollback: '回滚检查',
+                            };
+                            const label = labels[d.type] || '校验错误';
+                            html += `<div class="vcd-row fail">❌ ${label}: ${escapeHtml(String(d.error).substring(0,200))}</div>`;
                         }
                     }
                     html += '</div>';
