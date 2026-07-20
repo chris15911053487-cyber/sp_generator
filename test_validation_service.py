@@ -109,9 +109,10 @@ def test_query_sp_is_executed_as_temporary_procedure_and_rolled_back(monkeypatch
     assert result["syntax_ok"] is True
     assert result["business_ok"] is True
     assert connection._cursor.executed[:2] == [
-        "SET TRANSACTION ISOLATION LEVEL SNAPSHOT",
+        "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
         "SET XACT_ABORT ON",
     ]
+    assert not any("SNAPSHOT" in sql for sql in connection._cursor.executed)
     assert connection.timeout == validation.QUERY_TIMEOUT_SECONDS
     assert connection.rollback_called is True
     assert connection.closed is True

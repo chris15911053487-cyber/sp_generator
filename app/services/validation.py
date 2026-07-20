@@ -580,13 +580,7 @@ def validate_sp_bundle(sp: dict, verify_queries: list[dict], params: dict | None
         conn = get_connection(autocommit=False)
         conn.timeout = QUERY_TIMEOUT_SECONDS
         cursor = conn.cursor()
-        if operation_type == "query":
-            try:
-                cursor.execute("SET TRANSACTION ISOLATION LEVEL SNAPSHOT")
-            except Exception:
-                cursor.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
-        else:
-            cursor.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+        cursor.execute("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
         cursor.execute("SET XACT_ABORT ON")
         cursor.execute("BEGIN TRANSACTION")
 
