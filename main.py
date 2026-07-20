@@ -114,6 +114,13 @@ async def config_page():
             <label>用户名 <input id="cfg-db-user" placeholder="sa"></label>
             <label>密码 <input id="cfg-db-password" type="password" placeholder="密码"></label>
             <label>账套 <input id="cfg-db-database" placeholder="B1UP_DEMO"></label>
+            <label>数据库环境
+                <select id="cfg-db-environment">
+                    <option value="">未确认</option>
+                    <option value="test">测试环境</option>
+                </select>
+            </label>
+            <p>只有明确选择测试环境后，才允许校验写入型存储过程或执行部署。</p>
             <button onclick="testDbConnection()">测试连接</button>
             <span id="db-test-result"></span>
         </div>
@@ -135,6 +142,7 @@ async def config_page():
         document.getElementById('cfg-db-user').value = d.db.user || '';
         document.getElementById('cfg-db-password').value = d.db.password || '';
         document.getElementById('cfg-db-database').value = d.db.database || '';
+        document.getElementById('cfg-db-environment').value = d.db.environment || '';
         document.getElementById('cfg-llm-key').value = d.llm.api_key || '';
         document.getElementById('cfg-llm-url').value = d.llm.base_url || '';
         document.getElementById('cfg-llm-model').value = d.llm.model_name || '';
@@ -152,12 +160,13 @@ async def config_page():
             ['db_user', document.getElementById('cfg-db-user').value],
             ['db_password', document.getElementById('cfg-db-password').value],
             ['db_database', document.getElementById('cfg-db-database').value],
+            ['db_environment', document.getElementById('cfg-db-environment').value],
             ['llm_api_key', document.getElementById('cfg-llm-key').value],
             ['llm_base_url', document.getElementById('cfg-llm-url').value],
             ['llm_model_name', document.getElementById('cfg-llm-model').value],
         ];
         for (const [k, v] of items) {
-            if (v) await fetch('/api/config', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:k,value:v})});
+            if (v || k === 'db_environment') await fetch('/api/config', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:k,value:v})});
         }
         alert('配置已保存');
     }

@@ -6,17 +6,21 @@ from fastapi import APIRouter
 from app.db.sqlite import get_sps, get_verify_queries, update_sp
 from app.db.sqlserver import _deployable_code, check_syntax, deploy_procedures_atomically
 from app.services.validation import compute_bundle_hash, validate_reporting_procedure
+from config import get_db_config, is_explicit_test_database
 
 router = APIRouter(prefix="/api/deploy", tags=["deploy"])
 
 
 def _readiness(session_id: str) -> tuple[bool, list[dict], list[dict]]:
     procedures = get_sps(session_id)
+    test_database_confirmed = is_explicit_test_database(get_db_config())
     results = []
     all_ready = bool(procedures)
     for sp in procedures:
         queries = get_verify_queries(sp["id"])
         reasons = []
+        if not test_database_confirmed:
+            reasons.append("部署只允许在已明确配置的测试数据库执行")
         syntax_ok, syntax_error = check_syntax(sp["code"])
         current_hash = compute_bundle_hash(sp, queries)
         if not syntax_ok:

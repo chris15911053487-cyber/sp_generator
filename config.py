@@ -10,7 +10,7 @@ DEFAULT_CONFIG = {
     "db_user": "",
     "db_password": "",
     "db_database": "",
-    "db_environment": "test",
+    "db_environment": "",
     "llm_api_key": "",
     "llm_base_url": "https://api.deepseek.com/v1",
     "llm_model_name": "deepseek-v4-pro",
@@ -32,6 +32,19 @@ def init_config() -> None:
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     _ensure_table(conn)
+    migration = conn.execute(
+        "SELECT 1 FROM config WHERE key = ?",
+        ("config_safety_migration_v1",),
+    ).fetchone()
+    if migration is None:
+        # 旧版本会静默写入 test。升级后要求用户在配置页重新明确确认。
+        conn.execute(
+            "UPDATE config SET value = '' WHERE key = 'db_environment'"
+        )
+        conn.execute(
+            "INSERT INTO config (key, value) VALUES (?, ?)",
+            ("config_safety_migration_v1", "1"),
+        )
     for key, value in DEFAULT_CONFIG.items():
         conn.execute(
             "INSERT OR IGNORE INTO config (key, value) VALUES (?, ?)",
@@ -75,8 +88,14 @@ def get_db_config() -> dict:
         "user": get_config("db_user"),
         "password": get_config("db_password"),
         "database": get_config("db_database"),
-        "environment": get_config("db_environment", "test"),
+        "environment": get_config("db_environment", ""),
     }
+
+
+def is_explicit_test_database(config: dict) -> bool:
+    environment = str(config.get("environment") or "").strip().lower()
+    database = str(config.get("database") or "").strip()
+    return environment == "test" and bool(database)
 
 
 def get_llm_config() -> dict:

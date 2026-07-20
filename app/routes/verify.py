@@ -76,9 +76,16 @@ def _persist_result(sp: dict, queries: list[dict], result: dict) -> None:
         detail.get("query_id"): detail
         for detail in result.get("details", []) if detail.get("query_id")
     }
+    global_failure = next(
+        (
+            detail for detail in result.get("details", [])
+            if not detail.get("pass", False) and not detail.get("query_id")
+        ),
+        None,
+    )
     for query in queries:
         query_id = query.get("id")
-        detail = detail_by_id.get(query_id)
+        detail = detail_by_id.get(query_id) or global_failure
         if not query_id or detail is None:
             continue
         update_verify_query(

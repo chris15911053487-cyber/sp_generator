@@ -10,6 +10,7 @@ from app.db.sqlite import (
 )
 from app.db.sqlserver import _serialize_value, get_connection
 from app.services.validation import compute_bundle_hash
+from config import get_db_config, is_explicit_test_database
 
 router = APIRouter(prefix="/api/sp", tags=["stored_procedures"])
 MAX_EXECUTE_ROWS = 50000
@@ -93,6 +94,12 @@ def api_execute_sp(sp_id: str, req: ExecuteSpRequest):
             "not_deployed": True,
         }
     operation_type = sp.get("operation_type") or "query"
+    if operation_type != "query" and not is_explicit_test_database(get_db_config()):
+        return {
+            "ok": False,
+            "error": "写入型存储过程只允许在已明确配置的测试数据库执行。",
+            "environment_required": True,
+        }
     if operation_type != "query" and not req.confirm_write:
         return {
             "ok": False,

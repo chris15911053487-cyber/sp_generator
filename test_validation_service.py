@@ -54,6 +54,7 @@ class _Cursor:
 class _Connection:
     def __init__(self, write=False):
         self._cursor = _Cursor(write=write)
+        self.timeout = None
         self.rollback_called = False
         self.closed = False
 
@@ -105,6 +106,7 @@ def test_query_sp_is_executed_as_temporary_procedure_and_rolled_back(monkeypatch
 
     assert result["syntax_ok"] is True
     assert result["business_ok"] is True
+    assert connection.timeout == validation.QUERY_TIMEOUT_SECONDS
     assert connection.rollback_called is True
     assert connection.closed is True
 
@@ -316,11 +318,12 @@ def test_write_validation_fails_when_rollback_fails(monkeypatch):
     assert result["restore_confirmed"] is False
 
 
-def test_write_validation_rejects_empty_test_database(monkeypatch):
+@pytest.mark.parametrize(("database", "environment"), [("", "test"), ("ProductionDB", "")])
+def test_write_validation_requires_explicit_test_database(monkeypatch, database, environment):
     monkeypatch.setattr(validation, "check_syntax", lambda _code: (True, ""))
     monkeypatch.setattr(
         validation, "get_db_config",
-        lambda: {"database": "", "environment": "test"},
+        lambda: {"database": database, "environment": environment},
     )
     sp = {
         "name": "sp_Delete", "operation_type": "delete", "parameters": "[]",

@@ -9,7 +9,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from app.db.sqlserver import _serialize_value, check_syntax, get_connection
-from config import get_db_config
+from config import get_db_config, is_explicit_test_database
 
 ALLOWED_OPERATION_TYPES = {"query", "insert", "update", "delete", "mixed"}
 DIRECT_COMPARE_MODES = {"scalar", "keyed_rows"}
@@ -569,10 +569,7 @@ def validate_sp_bundle(sp: dict, verify_queries: list[dict], params: dict | None
         return result
 
     cfg = get_db_config()
-    if operation_type != "query" and (
-        cfg.get("environment") != "test"
-        or not str(cfg.get("database") or "").strip()
-    ):
+    if operation_type != "query" and not is_explicit_test_database(cfg):
         result["details"].append({"type": "safety", "pass": False,
                                   "error": "写入型校验只允许在已明确配置的 environment=test 数据库执行"})
         return result
@@ -581,8 +578,8 @@ def validate_sp_bundle(sp: dict, verify_queries: list[dict], params: dict | None
     change_contexts = {}
     try:
         conn = get_connection(autocommit=False)
+        conn.timeout = QUERY_TIMEOUT_SECONDS
         cursor = conn.cursor()
-        cursor.timeout = QUERY_TIMEOUT_SECONDS
         cursor.execute("SET XACT_ABORT ON")
         if operation_type == "query":
             try:
@@ -663,7 +660,6 @@ def validate_sp_bundle(sp: dict, verify_queries: list[dict], params: dict | None
                     restored = bool(change_contexts)
                     try:
                         restore_cursor = conn.cursor()
-                        restore_cursor.timeout = QUERY_TIMEOUT_SECONDS
                         for _, before, target, spec in change_contexts.values():
                             rows = _run_query(
                                 restore_cursor, spec["snapshot_sql"], params

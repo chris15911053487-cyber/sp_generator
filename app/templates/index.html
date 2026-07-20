@@ -1440,6 +1440,24 @@
                     }
                 }
             }
+
+            // 执行器或安全检查等全局失败没有 query_id；所有尚未得到逐项
+            // 结果的校验 SQL 都应显示失败，不能继续停留在 pending。
+            const globalFailure = result.details.find(d => !d.pass && !d.query_id);
+            if (globalFailure) {
+                for (const vqStatus of spGroup.querySelectorAll('.verify-status.pending')) {
+                    const queryId = vqStatus.id.replace('vq-status-', '');
+                    vqStatus.textContent = 'fail';
+                    vqStatus.className = 'verify-status fail';
+                    const vqIcon = document.getElementById('vq-icon-' + queryId);
+                    const vqResult = document.getElementById('vq-result-' + queryId);
+                    if (vqIcon) vqIcon.textContent = '❌';
+                    if (vqResult) {
+                        vqResult.innerHTML = '<pre class="vq-result-detail">' +
+                            escapeHtml(String(globalFailure.error || '校验执行失败').substring(0, 300)) + '</pre>';
+                    }
+                }
+            }
         }
     }
 
@@ -1482,6 +1500,12 @@
                         detail = escapeHtml(String(d.error).substring(0,200));
                     }
                     html += `<div class="spr-row ${d.pass?'pass':'fail'}">${mark} ${escapeHtml(d.query||'')}: ${detail}</div>`;
+                } else if (!d.pass && d.error) {
+                    const labels = {
+                        safety: '安全检查', execution: '执行错误', rollback: '回滚检查',
+                    };
+                    const label = labels[d.type] || '校验错误';
+                    html += `<div class="spr-row fail">❌ ${label}: ${escapeHtml(String(d.error).substring(0,300))}</div>`;
                 }
             }
             html += '</div>';

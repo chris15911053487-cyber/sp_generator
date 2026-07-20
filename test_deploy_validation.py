@@ -20,7 +20,15 @@ def _fixture():
     return sp, queries
 
 
+def _test_database(monkeypatch):
+    monkeypatch.setattr(
+        deploy, "get_db_config",
+        lambda: {"database": "TestDB", "environment": "test"},
+    )
+
+
 def test_deploy_check_accepts_exact_validated_version(monkeypatch):
+    _test_database(monkeypatch)
     sp, queries = _fixture()
     monkeypatch.setattr(deploy, "get_sps", lambda _session_id: [sp])
     monkeypatch.setattr(deploy, "get_verify_queries", lambda _sp_id: queries)
@@ -33,6 +41,7 @@ def test_deploy_check_accepts_exact_validated_version(monkeypatch):
 
 
 def test_deploy_check_blocks_changed_sp_without_running_deploy(monkeypatch):
+    _test_database(monkeypatch)
     sp, queries = _fixture()
     sp["code"] = "CREATE PROCEDURE sp_Test AS SELECT 2 AS X"
     called = []
@@ -50,6 +59,7 @@ def test_deploy_check_blocks_changed_sp_without_running_deploy(monkeypatch):
     assert called == []
 
 def test_deploy_check_rejects_record_and_code_name_mismatch(monkeypatch):
+    _test_database(monkeypatch)
     sp, queries = _fixture()
     sp["name"] = "sp_Other"
     sp["validated_hash"] = compute_bundle_hash(sp, queries)
@@ -93,6 +103,30 @@ def test_revalidated_deployed_version_keeps_deployed_status(monkeypatch):
 
     assert changes[0]["status"] == "deployed"
     assert result["status"] == "deployed"
+
+
+def test_global_failure_marks_pending_queries_failed(monkeypatch):
+    from app.routes import verify
+
+    sp, queries = _fixture()
+    query_updates = []
+    monkeypatch.setattr(verify, "update_sp", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        verify, "update_verify_query",
+        lambda query_id, **kwargs: query_updates.append((query_id, kwargs)),
+    )
+    result = {
+        "syntax_ok": True,
+        "business_ok": False,
+        "bundle_hash": sp["validated_hash"],
+        "details": [{"type": "execution", "pass": False, "error": "boom"}],
+    }
+
+    verify._persist_result(sp, queries, result)
+
+    assert query_updates[0][0] == "vq-1"
+    assert query_updates[0][1]["status"] == "fail"
+    assert "boom" in query_updates[0][1]["result_detail"]
 
 
 def test_atomic_deployment_rolls_back_all_when_second_sp_fails(monkeypatch):
@@ -204,3 +238,44 @@ def test_unsaved_verified_content_remains_draft(monkeypatch):
     assert response["result"]["unsaved"] is True
     assert response["result"]["status"] == "draft"
     assert response["result"]["deployment_eligible"] is False
+
+
+def test_deploy_requires_explicit_test_environment(monkeypatch):
+    sp, queries = _fixture()
+    monkeypatch.setattr(deploy, "get_sps", lambda _session_id: [sp])
+    monkeypatch.setattr(deploy, "get_verify_queries", lambda _sp_id: queries)
+    monkeypatch.setattr(deploy, "check_syntax", lambda _code: (True, ""))
+    monkeypatch.setattr(
+        deploy, "get_db_config",
+        lambda: {"database": "ProductionDB", "environment": ""},
+    )
+
+    ready, results, _ = deploy._readiness("session-1")
+
+    assert ready is False
+    assert "测试数据库" in results[0]["error"]
+
+
+def test_write_execution_requires_explicit_test_environment(monkeypatch):
+    from app.routes import sp as sp_route
+
+    stored, queries = _fixture()
+    stored.update(operation_type="delete", deployed_at="2026-07-20T12:00:00")
+    stored["deployed_hash"] = compute_bundle_hash(stored, queries)
+    monkeypatch.setattr(sp_route, "get_sp", lambda _sp_id: stored)
+    monkeypatch.setattr(sp_route, "get_verify_queries", lambda _sp_id: queries)
+    monkeypatch.setattr(
+        sp_route, "get_db_config",
+        lambda: {"database": "ProductionDB", "environment": ""},
+    )
+    monkeypatch.setattr(
+        sp_route, "get_connection",
+        lambda: pytest.fail("环境门禁失败时不应连接数据库"),
+    )
+
+    response = sp_route.api_execute_sp(
+        stored["id"], sp_route.ExecuteSpRequest(confirm_write=True),
+    )
+
+    assert response["ok"] is False
+    assert response["environment_required"] is True
