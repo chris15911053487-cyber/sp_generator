@@ -1,11 +1,18 @@
 """存储过程管理 API — 列表、更新、删除、执行。"""
 import json
+import re
+
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
-from app.db.sqlite import get_sps, update_sp, delete_sp
-from app.db.sqlserver import get_connection, _serialize_value
+from pydantic import BaseModel, Field
+
+from app.db.sqlite import (
+    delete_sp, get_sp, get_sps, get_verify_queries, update_sp,
+)
+from app.db.sqlserver import _serialize_value, get_connection
+from app.services.validation import compute_bundle_hash
 
 router = APIRouter(prefix="/api/sp", tags=["stored_procedures"])
+MAX_EXECUTE_ROWS = 50000
 
 
 class UpdateSpRequest(BaseModel):
@@ -14,7 +21,8 @@ class UpdateSpRequest(BaseModel):
 
 
 class ExecuteSpRequest(BaseModel):
-    params: dict = {}
+    params: dict = Field(default_factory=dict)
+    confirm_write: bool = False
 
 
 @router.get("/{session_id}")
@@ -24,14 +32,14 @@ def api_get_sps(session_id: str):
 
 @router.put("/{sp_id}")
 def api_update_sp(sp_id: str, req: UpdateSpRequest):
-    kwargs = {}
-    if req.name is not None:
-        kwargs["name"] = req.name
-    if req.code is not None:
-        kwargs["code"] = req.code
-    if not kwargs:
+    changes = {key: value for key, value in req.model_dump().items() if value is not None}
+    if not changes:
         raise HTTPException(400, "没有可更新的字段")
-    update_sp(sp_id, **kwargs)
+    changes.update(
+        status="draft", syntax_valid=0, business_valid=0,
+        validated_hash=None, verify_result=None,
+    )
+    update_sp(sp_id, **changes)
     return {"ok": True}
 
 
@@ -41,74 +49,78 @@ def api_delete_sp(sp_id: str):
     return {"ok": True}
 
 
+def _execution(sp: dict, params: dict) -> tuple[str, list]:
+    name = sp["name"]
+    if not re.match(r"^[A-Za-z_][A-Za-z0-9_.]*$", name):
+        raise ValueError("非法存储过程名称")
+    try:
+        definitions = json.loads(sp.get("parameters") or "[]")
+    except (TypeError, json.JSONDecodeError):
+        definitions = []
+    assignments = []
+    values = []
+    for definition in definitions:
+        parameter = str(definition.get("name", "")).lstrip("@")
+        if not parameter:
+            continue
+        if parameter in params:
+            value = params[parameter]
+        elif definition.get("default") not in (None, ""):
+            value = definition["default"]
+        else:
+            continue
+        assignments.append(f"@{parameter} = ?")
+        values.append(value)
+    safe_name = ".".join(f"[{part}]" for part in name.split("."))
+    sql = f"EXEC {safe_name}"
+    if assignments:
+        sql += " " + ", ".join(assignments)
+    return sql, values
+
+
 @router.post("/execute/{sp_id}")
 def api_execute_sp(sp_id: str, req: ExecuteSpRequest):
-    """执行存储过程并返回结果集。"""
-    from app.db.sqlite import _get_conn as get_sqlite_conn
-
-    # 从 SQLite 获取 SP 信息
-    conn_lite = get_sqlite_conn()
-    row = conn_lite.execute(
-        "SELECT name, parameters, status, deployed_at FROM stored_procedures WHERE id = ?", (sp_id,)
-    ).fetchone()
-    conn_lite.close()
-
-    if not row:
+    """执行已经由本系统部署的版本；写入型执行必须明确确认。"""
+    sp = get_sp(sp_id)
+    if not sp:
         raise HTTPException(404, "存储过程不存在")
-
-    # 检查是否已部署
-    if row["status"] != "deployed" and not row["deployed_at"]:
+    current_hash = compute_bundle_hash(sp, get_verify_queries(sp_id))
+    if (not sp.get("deployed_hash") or not sp.get("deployed_at")
+            or sp["deployed_hash"] != current_hash):
         return {
             "ok": False,
-            "error": f"存储过程 [{row['name']}] 尚未部署到 SQL Server，请先点击「🚀 一键部署」后再执行。",
+            "error": f"存储过程 [{sp['name']}] 尚未由本系统部署，请先点击一键部署。",
             "not_deployed": True,
         }
+    operation_type = sp.get("operation_type") or "query"
+    if operation_type != "query" and not req.confirm_write:
+        return {
+            "ok": False,
+            "error": f"该过程包含 {operation_type.upper()} 操作，必须确认后才能永久修改测试数据库。",
+            "confirmation_required": True,
+        }
 
-    sp_name = row["name"]
-    param_defs = []
     try:
-        param_defs = json.loads(row["parameters"] or "[]")
-    except (json.JSONDecodeError, TypeError):
-        pass
-
-    # 构建 EXEC 语句
-    param_parts = []
-    for p in param_defs:
-        pname = p.get("name", "")
-        if not pname.startswith("@"):
-            pname = "@" + pname
-        # 从请求参数中获取值
-        key = pname.lstrip("@")
-        if key in req.params:
-            val = req.params[key]
-            if val is None or val == "":
-                param_parts.append(f"{pname} = NULL")
-            elif isinstance(val, (int, float)):
-                param_parts.append(f"{pname} = {val}")
-            else:
-                escaped = str(val).replace("'", "''")
-                param_parts.append(f"{pname} = '{escaped}'")
-        elif p.get("default"):
-            # 使用默认值
-            pass
-        else:
-            param_parts.append(f"{pname} = NULL")
-
-    exec_sql = f"EXEC [{sp_name}]"
-    if param_parts:
-        exec_sql += " " + ", ".join(param_parts)
-
-    # 执行并获取结果
-    try:
+        exec_sql, values = _execution(sp, req.params)
         conn = get_connection()
         cursor = conn.cursor()
-        cursor.execute(exec_sql)
-        columns = [col[0] for col in cursor.description] if cursor.description else []
-        rows = []
-        if columns:
-            for r in cursor.fetchall():
-                rows.append({col: _serialize_value(val) for col, val in zip(columns, r)})
+        cursor.timeout = 60
+        cursor.execute(exec_sql, values)
+        while cursor.description is None and cursor.nextset():
+            pass
+        columns = [column[0] for column in cursor.description] if cursor.description else []
+        fetched = cursor.fetchmany(MAX_EXECUTE_ROWS + 1) if columns else []
+        if len(fetched) > MAX_EXECUTE_ROWS:
+            conn.close()
+            return {"ok": False, "error": f"结果超过 {MAX_EXECUTE_ROWS} 行限制"}
+        rows = [
+            {column: _serialize_value(value) for column, value in zip(columns, row)}
+            for row in fetched
+        ]
         conn.close()
-        return {"ok": True, "columns": columns, "rows": rows, "sql": exec_sql}
-    except Exception as e:
-        return {"ok": False, "error": str(e), "sql": exec_sql}
+        return {
+            "ok": True, "columns": columns, "rows": rows,
+            "operation_type": operation_type,
+        }
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}

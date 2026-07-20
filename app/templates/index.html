@@ -45,7 +45,7 @@
             <div id="sp-list"></div>
 
             <div id="deploy-actions">
-                <button id="btn-precheck" onclick="precheckDeploy()">🔍 一键预检</button>
+                <button id="btn-precheck" onclick="precheckDeploy()">🔍 部署检查</button>
                 <button id="btn-deploy" onclick="deployAll()" disabled>🚀 一键部署</button>
                 <div id="deploy-result"></div>
             </div>
@@ -223,6 +223,8 @@
     let currentSessionId = '';
     let cmInstances = {};  // 缓存 CodeMirror 实例
     let lastVerifyResults = {};  // 缓存最近一次校验结果 {sp_id: result}
+    let spCache = {};  // 当前 SP 元数据
+    let verifyQueryCache = {};  // 当前校验 SQL 元数据
     let currentReader = null;  // 当前流式读取器，用于停止生成
     let isGenerating = false;  // 是否正在生成
 
@@ -876,6 +878,8 @@
         // 清除 CodeMirror 实例缓存：innerHTML 替换会销毁 DOM，
         // 不清缓存会导致后续 initCodeMirror 被旧引用阻塞，代码区空白
         cmInstances = {};
+        spCache = {};
+        verifyQueryCache = {};
         const container = document.getElementById('sp-list');
 
         const spR = await fetch(`/api/sp/${currentSessionId}`);
@@ -887,6 +891,7 @@
 
         let html = '';
         for (const sp of spData.procedures) {
+            spCache[sp.id] = sp;
             const statusLabel = {draft:'草稿', verified:'已校验', verify_failed:'校验失败', deployed:'已部署'}[sp.status] || sp.status;
             const statusCls = sp.status || 'draft';
             const synIcon = sp.syntax_valid ? '✅' : (sp.syntax_valid === 0 ? '❌' : '⬜');
@@ -896,6 +901,7 @@
             const vR = await fetch(`/api/verify/${currentSessionId}/sp/${sp.id}`);
             const vData = await vR.json();
             const vqs = vData.verify_queries || [];
+            verifyQueryCache[sp.id] = vqs;
 
             html += `
             <div class="sp-group">
@@ -1123,6 +1129,37 @@
 
     // ====== SP 校验 / 保存+校验 ======
 
+    function editorValue(textareaId) {
+        const cm = cmInstances[textareaId];
+        if (cm) return cm.getValue();
+        const textarea = document.getElementById(textareaId);
+        return textarea ? textarea.value : '';
+    }
+
+    function collectVerifyQueries(spId) {
+        return (verifyQueryCache[spId] || []).map(vq => ({
+            id: vq.id,
+            name: vq.name,
+            sql_code: editorValue('vq-editor-' + vq.id),
+            compare_columns: vq.compare_columns || '',
+            validation_spec: (() => {
+                try { return JSON.parse(vq.validation_spec || '{}'); }
+                catch(e) { return {}; }
+            })(),
+        }));
+    }
+
+    function verifyRequestBody(spId, save) {
+        const params = collectParams(spId);
+        return {
+            code: editorValue('sp-editor-' + spId),
+            params: Object.keys(params).length > 0 ? params : undefined,
+            operation_type: (spCache[spId] || {}).operation_type || 'query',
+            verify_queries: collectVerifyQueries(spId),
+            save: !!save,
+        };
+    }
+
     // ====== 执行存储过程 ======
     let execResultsCache = {};  // 缓存执行结果 {sp_id: {columns, rows}}
 
@@ -1141,10 +1178,19 @@
         });
 
         try {
+            const operationType = (spCache[spId] || {}).operation_type || 'query';
+            let confirmWrite = false;
+            if (operationType !== 'query') {
+                confirmWrite = confirm(`该存储过程类型为 ${operationType.toUpperCase()}，执行后将永久修改测试数据库。是否继续？`);
+                if (!confirmWrite) {
+                    statusEl.textContent = '已取消执行';
+                    return;
+                }
+            }
             const r = await fetch(`/api/sp/execute/${spId}`, {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({params}),
+                body: JSON.stringify({params, confirm_write: confirmWrite}),
             });
             const data = await r.json();
 
@@ -1281,16 +1327,11 @@
         statusEl.textContent = '⏳ 校验中...';
         statusEl.className = 'sp-action-status running';
 
-        const editorKey = 'sp-editor-' + spId;
-        const cm = cmInstances[editorKey];
-        const code = cm ? cm.getValue() : '';
-
         try {
-            const params = collectParams(spId);
             const r = await fetch(`/api/verify/sp/${spId}`, {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({code: code, params: Object.keys(params).length > 0 ? params : undefined}),
+                body: JSON.stringify(verifyRequestBody(spId, false)),
             });
             const data = await r.json();
             if (data.ok) {
@@ -1298,7 +1339,9 @@
                 showSpVerifyResult(spId, data.result);
                 const allPass = data.result && data.result.syntax_ok && data.result.business_ok;
                 if (allPass) {
-                    statusEl.textContent = '✅ 校验完成';
+                    statusEl.textContent = data.result.unsaved
+                        ? '⚠️ 校验通过，但尚未保存，不可部署'
+                        : '✅ 校验完成';
                     statusEl.className = 'sp-action-status success';
                 } else {
                     statusEl.textContent = '❌ 校验未通过';
@@ -1320,24 +1363,12 @@
         statusEl.textContent = '⏳ 保存并校验中...';
         statusEl.className = 'sp-action-status running';
 
-        const editorKey = 'sp-editor-' + spId;
-        const cm = cmInstances[editorKey];
-        const code = cm ? cm.getValue() : '';
-
         try {
-            const params = collectParams(spId);
-            // 1. 保存 SP 代码
-            await fetch(`/api/sp/${spId}`, {
-                method: 'PUT',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({code: code}),
-            });
-
-            // 2. 校验
+            // 后端在一个 SQLite 事务中保存 SP、校验 SQL和规格，然后执行完整校验。
             const r = await fetch(`/api/verify/sp/${spId}`, {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({code: code, params: Object.keys(params).length > 0 ? params : undefined}),
+                body: JSON.stringify(verifyRequestBody(spId, true)),
             });
             const data = await r.json();
             if (data.ok) {
@@ -1372,8 +1403,13 @@
         const statusEl = spGroup.querySelector('.sp-status');
         if (statusEl) {
             const allOk = result.syntax_ok && result.business_ok;
-            statusEl.textContent = allOk ? '已校验' : '校验失败';
-            statusEl.className = 'sp-status ' + (allOk ? 'verified' : 'verify_failed');
+            const status = result.status || (allOk ? 'verified' : 'verify_failed');
+            const labels = {
+                draft: '草稿', verified: '已校验',
+                verify_failed: '校验失败', deployed: '已部署',
+            };
+            statusEl.textContent = labels[status] || status;
+            statusEl.className = 'sp-status ' + status;
         }
 
         // 更新语法/业务图标
@@ -1414,6 +1450,9 @@
         const synIcon = result.syntax_ok ? '✅' : '❌';
         const bizIcon = result.business_ok ? '✅' : '❌';
         let html = `<div class="spr-summary">${synIcon} 语法 &nbsp; ${bizIcon} 业务</div>`;
+        if (result.unsaved) {
+            html += '<div class="spr-row fail">⚠️ 当前编辑内容尚未保存，本次结果不能用于部署</div>';
+        }
 
         if (result.details && result.details.length > 0) {
             html += '<div class="spr-details">';
@@ -1459,10 +1498,10 @@
         const data = await r.json();
         const rd = document.getElementById('deploy-result');
         if (data.ok) {
-            rd.innerHTML = '✅ 预检通过，可以部署';
+            rd.innerHTML = '✅ 部署检查通过，可以部署';
             document.getElementById('btn-deploy').disabled = false;
         } else {
-            rd.innerHTML = (data.results || []).map(r => r.syntax_ok ? `✅ ${r.name}` : `❌ ${r.name}: ${r.error}`).join('<br>');
+            rd.innerHTML = (data.results || []).map(r => r.ready ? `✅ ${r.name}` : `❌ ${r.name}: ${r.error || (r.reasons || []).join('；')}`).join('<br>');
             document.getElementById('btn-deploy').disabled = true;
         }
     }

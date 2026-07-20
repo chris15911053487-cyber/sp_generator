@@ -32,8 +32,8 @@ def _build_conn_str() -> str:
     )
 
 
-def get_connection() -> pyodbc.Connection:
-    return pyodbc.connect(_build_conn_str(), autocommit=True)
+def get_connection(*, autocommit: bool = True) -> pyodbc.Connection:
+    return pyodbc.connect(_build_conn_str(), autocommit=autocommit)
 
 
 def execute_query(sql: str) -> list[dict]:
@@ -97,48 +97,56 @@ def _validate_sp_name(name: str) -> str:
     return name
 
 
-def deploy_procedure(name: str, code: str) -> tuple[bool, str]:
-    """部署存储过程到 SQL Server。返回 (成功, 错误信息)。
+def _deployable_code(name: str, code: str) -> str:
+    """将已校验代码规范为 CREATE OR ALTER，并校验代码内过程名。"""
+    name = _validate_sp_name(name)
+    match = re.match(
+        r'(?is)^\s*(?:CREATE\s+OR\s+ALTER|CREATE|ALTER)\s+PROC(?:EDURE)?\s+'
+        r'((?:\[[^\]]+\]|[A-Za-z_][\w$#]*)(?:\.(?:\[[^\]]+\]|[A-Za-z_][\w$#]*))?)',
+        code,
+    )
+    if not match:
+        raise ValueError("部署代码不是有效的存储过程定义")
+    code_name = match.group(1).replace("[", "").replace("]", "")
+    record_name = name.lower()
+    definition_name = code_name.lower()
+    record_base = record_name[4:] if record_name.startswith("dbo.") else record_name
+    definition_base = (
+        definition_name[4:] if definition_name.startswith("dbo.") else definition_name
+    )
+    if record_base != definition_base:
+        raise ValueError(f"记录名称 {name} 与代码过程名 {code_name} 不一致")
+    return re.sub(
+        r'(?is)^\s*(?:CREATE\s+OR\s+ALTER|CREATE|ALTER)\s+PROC(?:EDURE)?',
+        'CREATE OR ALTER PROCEDURE', code, count=1,
+    )
 
-    根据 code 内容智能判断部署策略：
-    - ALTER PROCEDURE：直接执行（存储过程必须已存在）
-    - CREATE PROCEDURE：先 DROP 再 CREATE
-    - 其他（如 CREATE OR ALTER）：直接执行
-    """
+
+def deploy_procedures_atomically(procedures: list[dict]) -> list[dict]:
+    """在一个事务中部署全部 SP，任一失败则整体回滚。"""
+    prepared = [
+        (item["id"], item["name"], _deployable_code(item["name"], item["code"]))
+        for item in procedures
+    ]
+    conn = get_connection(autocommit=False)
+    results = []
     try:
-        name = _validate_sp_name(name)
-    except ValueError as e:
-        return False, str(e)
-
-    # 判断 code 的操作类型
-    code_stripped = code.strip().upper()
-    is_alter = code_stripped.startswith("ALTER")
-    is_create = code_stripped.startswith("CREATE") and "OR ALTER" not in code_stripped[:50].upper()
-
-    conn = get_connection()
-    cursor = conn.cursor()
-    try:
-        if is_create:
-            # CREATE 语句需要先 DROP 已有的同名 SP
-            safe_name = name.replace("]", "]]")
-            cursor.execute(f"DROP PROCEDURE IF EXISTS [{safe_name}]")
-        elif is_alter:
-            # ALTER 语句要求 SP 已存在，检查一下，不存在则转为 CREATE
-            safe_name = name.replace("]", "]]")
-            cursor.execute(
-                "SELECT 1 FROM sys.procedures WHERE name = ?", (name,)
-            )
-            if cursor.fetchone() is None:
-                # SP 不存在，将 ALTER 转为 CREATE
-                code = re.sub(r'(?i)^\s*ALTER\s+PROC(EDURE)?', 'CREATE PROCEDURE', code, count=1)
-        # 对于 CREATE OR ALTER 或其他情况，直接执行即可
-        cursor.execute(code)
+        cursor = conn.cursor()
+        cursor.execute("SET XACT_ABORT ON")
+        for sp_id, name, code in prepared:
+            cursor.execute(code)
+            results.append({"sp_id": sp_id, "name": name, "success": True, "error": ""})
+        conn.commit()
+        return results
+    except Exception as exc:
+        conn.rollback()
+        error = str(exc)
+        return [
+            {"sp_id": sp_id, "name": name, "success": False, "error": error}
+            for sp_id, name, _ in prepared
+        ]
+    finally:
         conn.close()
-        return True, ""
-    except Exception as e:
-        conn.close()
-        return False, str(e)
-
 
 def get_table_columns(table_name: str) -> list[dict]:
     """查询表的列信息（参数化查询，防注入）。"""

@@ -43,6 +43,9 @@ def init_db() -> None:
             business_valid INTEGER DEFAULT 0,
             verify_result TEXT,
             parameters TEXT DEFAULT '[]',
+            operation_type TEXT DEFAULT 'query',
+            validated_hash TEXT,
+            deployed_hash TEXT,
             deployed_at TIMESTAMP,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -55,17 +58,34 @@ def init_db() -> None:
             name TEXT NOT NULL,
             sql_code TEXT NOT NULL,
             compare_columns TEXT,
+            validation_spec TEXT DEFAULT '{}',
             status TEXT DEFAULT 'pending',
             result_detail TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (sp_id) REFERENCES stored_procedures(id) ON DELETE CASCADE
         );
     """)
-    # 迁移：为已有数据库添加 parameters 列
-    try:
-        conn.execute("ALTER TABLE stored_procedures ADD COLUMN parameters TEXT DEFAULT '[]'")
-    except sqlite3.OperationalError:
-        pass  # 列已存在
+    migrations = {
+        "stored_procedures": {
+            "parameters": "TEXT DEFAULT '[]'",
+            "operation_type": "TEXT DEFAULT 'query'",
+            "validated_hash": "TEXT",
+            "deployed_hash": "TEXT",
+            "deployed_at": "TIMESTAMP",
+        },
+        "verify_queries": {
+            "validation_spec": "TEXT DEFAULT '{}'",
+        },
+    }
+    for table, columns in migrations.items():
+        existing = {
+            row["name"] for row in conn.execute(f"PRAGMA table_info({table})")
+        }
+        for column, definition in columns.items():
+            if column not in existing:
+                conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+                )
     conn.commit()
     conn.close()
 
@@ -132,13 +152,15 @@ def get_messages(session_id: str) -> list[dict]:
 
 # --- Stored Procedures ---
 
-def save_sp(session_id: str, name: str, code: str, parameters: str = '[]') -> dict:
+def save_sp(session_id: str, name: str, code: str, parameters: str = '[]',
+            operation_type: str = 'query') -> dict:
     conn = _get_conn()
     sp_id = str(uuid.uuid4())
     conn.execute(
-        """INSERT INTO stored_procedures (id, session_id, name, code, parameters)
-           VALUES (?, ?, ?, ?, ?)""",
-        (sp_id, session_id, name, code, parameters),
+        """INSERT INTO stored_procedures
+           (id, session_id, name, code, parameters, operation_type)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (sp_id, session_id, name, code, parameters, operation_type),
     )
     conn.commit()
     row = conn.execute(
@@ -158,9 +180,19 @@ def get_sps(session_id: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def get_sp(sp_id: str) -> dict | None:
+    conn = _get_conn()
+    row = conn.execute(
+        "SELECT * FROM stored_procedures WHERE id = ?", (sp_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
 def update_sp(sp_id: str, **kwargs) -> None:
     allowed = {"name", "code", "status", "syntax_valid",
-               "business_valid", "verify_result", "parameters", "deployed_at"}
+               "business_valid", "verify_result", "parameters", "deployed_at",
+               "operation_type", "validated_hash", "deployed_hash"}
     updates = {k: v for k, v in kwargs.items() if k in allowed}
     if not updates:
         return
@@ -225,13 +257,14 @@ def delete_sps_except(session_id: str, keep_ids: list) -> int:
 # --- Verify Queries ---
 
 def save_verify_query(sp_id: str, name: str, sql_code: str,
-                      compare_columns: str = "") -> dict:
+                      compare_columns: str = "", validation_spec: str = "{}") -> dict:
     conn = _get_conn()
     vq_id = str(uuid.uuid4())
     conn.execute(
-        """INSERT INTO verify_queries (id, sp_id, name, sql_code, compare_columns)
-           VALUES (?, ?, ?, ?, ?)""",
-        (vq_id, sp_id, name, sql_code, compare_columns),
+        """INSERT INTO verify_queries
+           (id, sp_id, name, sql_code, compare_columns, validation_spec)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (vq_id, sp_id, name, sql_code, compare_columns, validation_spec),
     )
     conn.commit()
     row = conn.execute(
@@ -252,7 +285,8 @@ def get_verify_queries(sp_id: str) -> list[dict]:
 
 
 def update_verify_query(query_id: str, **kwargs) -> None:
-    allowed = {"name", "sql_code", "compare_columns", "status", "result_detail"}
+    allowed = {"name", "sql_code", "compare_columns", "validation_spec",
+               "status", "result_detail"}
     updates = {k: v for k, v in kwargs.items() if k in allowed}
     if not updates:
         return
@@ -269,3 +303,69 @@ def update_verify_query(query_id: str, **kwargs) -> None:
     )
     conn.commit()
     conn.close()
+
+
+def save_sp_bundle(sp_id: str, code: str, parameters: str,
+                   operation_type: str, verify_queries: list[dict]) -> dict:
+    """原子保存 SP 与全部校验 SQL，并使旧校验结论失效。"""
+    import json
+
+    conn = _get_conn()
+    try:
+        cursor = conn.execute(
+            """UPDATE stored_procedures
+               SET code = ?, parameters = ?, operation_type = ?, status = 'draft',
+                   syntax_valid = 0, business_valid = 0, verify_result = NULL,
+                   validated_hash = NULL, updated_at = CURRENT_TIMESTAMP
+               WHERE id = ?""",
+            (code, parameters, operation_type, sp_id),
+        )
+        if cursor.rowcount == 0:
+            raise ValueError("SP 不存在")
+
+        existing_ids = {
+            row["id"] for row in conn.execute(
+                "SELECT id FROM verify_queries WHERE sp_id = ?", (sp_id,)
+            ).fetchall()
+        }
+        kept_ids = set()
+        for item in verify_queries:
+            query_id = item.get("id")
+            validation_spec = item.get("validation_spec", "{}")
+            if not isinstance(validation_spec, str):
+                validation_spec = json.dumps(validation_spec, ensure_ascii=False)
+            values = (
+                item.get("name", "未命名校验"), item.get("sql_code", ""),
+                item.get("compare_columns", ""), validation_spec,
+            )
+            if query_id in existing_ids:
+                conn.execute(
+                    """UPDATE verify_queries
+                       SET name = ?, sql_code = ?, compare_columns = ?,
+                           validation_spec = ?, status = 'pending', result_detail = NULL
+                       WHERE id = ? AND sp_id = ?""",
+                    values + (query_id, sp_id),
+                )
+                kept_ids.add(query_id)
+            else:
+                query_id = str(uuid.uuid4())
+                conn.execute(
+                    """INSERT INTO verify_queries
+                       (id, sp_id, name, sql_code, compare_columns, validation_spec)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (query_id, sp_id) + values,
+                )
+                kept_ids.add(query_id)
+
+        for query_id in existing_ids - kept_ids:
+            conn.execute("DELETE FROM verify_queries WHERE id = ?", (query_id,))
+        conn.commit()
+        row = conn.execute(
+            "SELECT * FROM stored_procedures WHERE id = ?", (sp_id,)
+        ).fetchone()
+        return dict(row)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()

@@ -20,7 +20,7 @@ from app.agent.prompts import (
     ASSUMPTIONS_PROMPT,
 )
 from app.agent.tools import create_tools
-from app.db.sqlserver import check_syntax, execute_query, deploy_procedure, substitute_params
+from app.db.sqlserver import check_syntax, execute_query, substitute_params
 from app.db.sqlite import save_sp, save_verify_query, get_messages
 from config import get_llm_config
 
@@ -762,12 +762,11 @@ def _generate_verify_sql_for_sp(llm: ChatOpenAI, sp_row: dict, design: str, veri
 
     vq_prompt = VERIFY_SQL_PROMPT.format(
         sp_name=sp_row["name"],
-        sp_code=sp_row["code"],
         design=design,
-        verify_logic=verify_logic_text or "无（请根据SP代码自行设计校验逻辑）",
+        verify_logic=verify_logic_text or "未提取到结构化校验逻辑；仅依据已确认设计生成，禁止参考 SP 实现。",
     )
     vq_messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=vq_prompt)]
-    # 校验 SQL 严格派生自已确认的设计和 SP 代码，无需再次做 schema 探测。
+    # 校验 SQL 严格派生自已确认的设计，不向该调用提供 SP 主体。
     vq_response = llm.invoke(vq_messages)
     vq_data = _parse_json(vq_response.content)
 
@@ -783,6 +782,7 @@ def _generate_verify_sql_for_sp(llm: ChatOpenAI, sp_row: dict, design: str, veri
                 vq.get("name", "未命名校验"),
                 vq.get("sql_code", ""),
                 vq.get("compare_columns", ""),
+                json.dumps(vq.get("validation_spec", {}), ensure_ascii=False),
             )
             sql_placeholders |= _parse_sql_placeholders(vq.get("sql_code", ""))
         llm_params = vq_data.get("parameters", [])
@@ -804,7 +804,9 @@ def _generate_verify_sql_for_sp(llm: ChatOpenAI, sp_row: dict, design: str, veri
 
 def generate_node(state: AgentState, config: RunnableConfig | None = None) -> dict:
     """代码生成节点 — 两阶段：先生成 SP，再为每个 SP 单独生成校验 SQL。"""
-    from app.db.sqlite import delete_sps_except
+    from app.db.sqlite import (
+        delete_sp, delete_sps_except, get_verify_queries,
+    )
 
     llm = _get_llm()
     stream_writer = _get_writer(config)
@@ -829,17 +831,29 @@ def generate_node(state: AgentState, config: RunnableConfig | None = None) -> di
             "raw_response": response.content,
         }
 
+    procedures = data.get("procedures", [])
+    if not isinstance(procedures, list) or not procedures:
+        return {"error": "LLM 未生成任何存储过程，已保留原有制品"}
+
     # parsed OK：先保存新 SP，再删除旧 SP（级联删除校验 SQL）。
     # 这样代码重新生成期间右侧列表始终有旧 SP，新 SP 全部就绪后才替换。
     sp_list = []
-    for proc in data.get("procedures", []):
-        # 清理代码：移除 GO 语句（SSMS 批处理分隔符，不是有效 T-SQL）
-        code = proc["code"].strip()
-        code = re.sub(r'\n\s*GO\s*\n', '\n', code, flags=re.IGNORECASE)
-        code = re.sub(r'\n\s*GO\s*$', '', code, flags=re.IGNORECASE)
-        sp = save_sp(session_id, proc["name"], code)
-        sp_row = dict(sp) if not isinstance(sp, dict) else sp
-        sp_list.append(sp_row)
+    try:
+        for proc in procedures:
+            # 清理代码：移除 GO 语句（SSMS 批处理分隔符，不是有效 T-SQL）
+            code = proc["code"].strip()
+            code = re.sub(r'\n\s*GO\s*\n', '\n', code, flags=re.IGNORECASE)
+            code = re.sub(r'\n\s*GO\s*$', '', code, flags=re.IGNORECASE)
+            sp = save_sp(
+                session_id, proc["name"], code,
+                operation_type=proc.get("operation_type", "query"),
+            )
+            sp_row = dict(sp) if not isinstance(sp, dict) else sp
+            sp_list.append(sp_row)
+    except Exception as exc:
+        for item in sp_list:
+            delete_sp(item["id"])
+        return {"error": f"保存新存储过程失败，已保留原有制品: {exc}"}
     _write_progress(
         stream_writer, "verify_sql",
         f"已生成 {len(sp_list)} 个存储过程，正在并行设计校验 SQL...",
@@ -852,6 +866,7 @@ def generate_node(state: AgentState, config: RunnableConfig | None = None) -> di
     verify_logic_map = _extract_verify_logic(design)
 
     MAX_PARALLEL = 3  # 最大并行数，避免 LLM API 限流
+    failures = []
     with ThreadPoolExecutor(max_workers=MAX_PARALLEL) as executor:
         futures = {
             executor.submit(
@@ -867,10 +882,36 @@ def generate_node(state: AgentState, config: RunnableConfig | None = None) -> di
                 future.result()
             except Exception as e:
                 print(f"[ERROR] 校验 SQL 生成失败: {sp_row.get('name')}: {e}", flush=True)
+                failures.append(f"{sp_row.get('name')}: {e}")
             completed += 1
             _write_progress(
                 stream_writer, "verify_sql", f"校验 SQL 进度：{completed}/{len(futures)}",
             )
+
+    for sp_row in sp_list:
+        queries = get_verify_queries(sp_row["id"])
+        required_modes = set()
+        for query in queries:
+            try:
+                spec = json.loads(query.get("validation_spec") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                spec = {}
+            if spec.get("required", True):
+                required_modes.add(spec.get("mode"))
+        expected_modes = (
+            {"scalar", "keyed_rows"}
+            if sp_row.get("operation_type", "query") == "query"
+            else {"change_set"}
+        )
+        if not required_modes.intersection(expected_modes):
+            failures.append(f"{sp_row['name']}: 缺少必选直接对账规则")
+
+    if failures:
+        for item in sp_list:
+            delete_sp(item["id"])
+        return {
+            "error": "校验 SQL 生成未完成，已保留原有制品: " + "；".join(failures),
+        }
 
     # 新 SP 全部就绪（代码 + 参数 + 校验 SQL），现在替换旧 SP
     delete_sps_except(session_id, [s["id"] for s in sp_list])
@@ -883,225 +924,55 @@ def generate_node(state: AgentState, config: RunnableConfig | None = None) -> di
 
 
 def verify_node(state: AgentState, config: RunnableConfig | None = None) -> dict:
-    """校验节点 — 语法+业务校验，失败时自动修复（最多 2 次迭代）。"""
-    from app.db.sqlite import get_verify_queries, get_sps, update_sp as db_update_sp, update_verify_query
+    """统一校验节点：临时执行 SP，不部署、不自动修改代码。"""
+    from app.db.sqlite import get_sps, get_verify_queries, update_sp as db_update_sp
+    from app.services.validation import validate_sp_bundle
 
-    llm = _get_llm()
     stream_writer = _get_writer(config)
-    _write_progress(stream_writer, "verify", "正在执行语法与业务数据校验...")
-
+    _write_progress(stream_writer, "verify", "正在执行语法、运行和业务数据校验...")
     sp_list = state.get("sp_list", [])
-    # 回退：如果状态中 sp_list 为空，从数据库加载
-    if not sp_list:
-        session_id = state.get("session_id", "")
-        if session_id:
-            sp_list = get_sps(session_id)
-            print(f"[DEBUG verify_node] fallback to DB, loaded {len(sp_list)} SPs", flush=True)
-    print(f"[DEBUG verify_node] sp_list count={len(sp_list)}, keys={list(state.keys())}", flush=True)
-    for i, sp in enumerate(sp_list):
-        print(f"[DEBUG verify_node]   [{i}] id={sp.get('id','?')[:8]}, name={sp.get('name','?')}, code_len={len(sp.get('code',''))}", flush=True)
+    if not sp_list and state.get("session_id"):
+        sp_list = get_sps(state["session_id"])
 
     results = []
-    all_pass = True
-    MAX_FIX_ROUNDS = 2  # 最多 2 次自动修复
-
-    for sp in sp_list:
-        sp_result = {"sp_id": sp["id"], "sp_name": sp.get("name", ""), "syntax_ok": False, "business_ok": False, "details": []}
-        # 用局部变量跟踪当前代码，不直接改 sp_list
-        current_code = sp["code"]
-
-        for fix_round in range(MAX_FIX_ROUNDS + 1):  # 初始 + 最多 MAX_FIX_ROUNDS 次修复
-            # === 语法校验 ===
-            syntax_ok, syntax_err = check_syntax(current_code)
-
-            # === 部署 SP（语法通过后临时部署，用于数据对比） ===
-            sp_deployed = False
-            if syntax_ok:
-                from app.db.sqlserver import deploy_procedure as _deploy_sp
-                deploy_ok, deploy_err = _deploy_sp(sp.get("name", ""), current_code)
-                if deploy_ok:
-                    sp_deployed = True
-                    db_update_sp(sp["id"], status="deployed")
-
-            # === 业务校验（含数据对比） ===
-            vqs = get_verify_queries(sp["id"])
-            params = {}
-            try:
-                param_list = json.loads(sp.get("parameters", "[]"))
-                params = {p["name"]: p.get("default", "") for p in param_list if p.get("default")}
-            except (json.JSONDecodeError, KeyError, TypeError):
-                pass
-
-            # 执行 SP 获取结果集
-            sp_rows = None
-            sp_exec_error = None
-            if sp_deployed:
-                try:
-                    from app.db.sqlserver import execute_sp_with_params, compare_sp_results
-                    param_defs = []
-                    try:
-                        param_defs = json.loads(sp.get("parameters", "[]"))
-                    except (json.JSONDecodeError, TypeError):
-                        pass
-                    sp_rows = execute_sp_with_params(sp.get("name", ""), params, param_defs)
-                except Exception as e:
-                    sp_exec_error = str(e)
-
-            biz_all_ok = True
-            verify_sql_errors = []
-            biz_errors = []
-            for vq in vqs:
-                try:
-                    sql_to_run = substitute_params(vq["sql_code"], params)
-                    verify_rows = execute_query(sql_to_run)
-
-                    # 数据对比
-                    compare_columns = vq.get("compare_columns", "")
-                    comparison = None
-                    if sp_rows is not None and compare_columns:
-                        from app.db.sqlserver import compare_sp_results
-                        comparison = compare_sp_results(sp_rows, verify_rows, compare_columns)
-                        is_pass = comparison["match"]
-                    elif sp_exec_error and compare_columns:
-                        is_pass = False
-                        comparison = {"match": False, "summary": f"SP 执行失败: {sp_exec_error}"}
-                    else:
-                        is_pass = True  # 无对比列或 SP 未部署
-
-                    if not is_pass:
-                        biz_all_ok = False
-                        biz_errors.append({
-                            "query": vq["name"],
-                            "error": comparison["summary"] if comparison else "数据不一致",
-                        })
-
-                    result_detail = {"rows": verify_rows[:20], "comparison": comparison}
-                    status = "pass" if is_pass else "fail"
-                    update_verify_query(vq["id"], status=status,
-                                        result_detail=json.dumps(result_detail, ensure_ascii=False, indent=2))
-                except Exception as e:
-                    biz_all_ok = False
-                    error_text = str(e)
-                    verify_sql_errors.append({
-                        "query_id": vq["id"],
-                        "query": vq["name"],
-                        "sql_code": vq["sql_code"],
-                        "error": error_text,
-                    })
-                    biz_errors.append({"query": vq["name"], "error": error_text})
-                    update_verify_query(vq["id"], status="fail", result_detail=str(e))
-
-            # 全部通过 → 跳出修复循环
-            if syntax_ok and biz_all_ok:
-                sp_result["syntax_ok"] = True
-                sp_result["business_ok"] = True
-                break
-
-            # 最后一轮仍未通过 → 记录结果
-            if fix_round >= MAX_FIX_ROUNDS:
-                sp_result["syntax_ok"] = syntax_ok
-                sp_result["business_ok"] = biz_all_ok
-                if not syntax_ok:
-                    sp_result["details"].append({"type": "syntax", "pass": False, "error": syntax_err})
-                for be in biz_errors:
-                    sp_result["details"].append({
-                        "type": "business", "pass": False,
-                        "query": be["query"], "error": be["error"],
-                    })
-                all_pass = False
-                break
-
-            # 校验 SQL 自身执行失败时先修复校验 SQL，不能把错误归因于 SP。
-            if verify_sql_errors:
-                _write_progress(
-                    stream_writer, "auto_fix",
-                    f"校验 SQL 执行失败，正在自动修正（第 {fix_round + 1}/{MAX_FIX_ROUNDS} 次）...",
-                )
-                for item in verify_sql_errors:
-                    prompt = FIX_VERIFY_SQL_PROMPT.format(
-                        query_name=item["query"],
-                        sql_code=item["sql_code"],
-                        error=item["error"],
-                    )
-                    response = llm.invoke([
-                        SystemMessage(content=SYSTEM_PROMPT),
-                        HumanMessage(content=prompt),
-                    ])
-                    fixed = _parse_json(response.content)
-                    if fixed and fixed.get("fixed_sql"):
-                        update_verify_query(
-                            item["query_id"], sql_code=fixed["fixed_sql"],
-                            status="pending", result_detail="",
-                        )
-                continue
-
-            # 进度通知不应暂停整张图；custom stream 可直接推送给 SSE。
-            _write_progress(
-                stream_writer, "auto_fix",
-                f"校验失败，正在自动修正（第 {fix_round + 1}/{MAX_FIX_ROUNDS} 次）...",
+    all_pass = bool(sp_list)
+    for original in sp_list:
+        current = next(
+            (item for item in get_sps(state.get("session_id", "")) if item["id"] == original["id"]),
+            original,
+        )
+        queries = get_verify_queries(current["id"])
+        params = {}
+        try:
+            definitions = json.loads(current.get("parameters") or "[]")
+            params = {
+                str(item.get("name", "")).lstrip("@"): item.get("default")
+                for item in definitions if item.get("default") not in (None, "")
+            }
+        except (TypeError, json.JSONDecodeError):
+            pass
+        result = validate_sp_bundle(current, queries, params)
+        passed = result["syntax_ok"] and result["business_ok"]
+        status = "verify_failed"
+        if passed:
+            status = (
+                "deployed"
+                if current.get("deployed_hash") == result["bundle_hash"]
+                else "verified"
             )
-
-            # === 调用 LLM 修复代码 ===
-            errors_text = []
-            if not syntax_ok:
-                errors_text.append(f"[语法错误] {syntax_err}")
-            if biz_errors:
-                errors_text.append(f"[业务校验失败] {json.dumps(biz_errors, ensure_ascii=False)}")
-
-            fix_prompt = FIX_SP_PROMPT.format(
-                sp_name=sp.get("name", ""),
-                sp_code=current_code,
-                errors="\n".join(errors_text),
-            )
-            fix_messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=fix_prompt)]
-            # 修复阶段只需结构化改写，不携带工具，避免无关工具循环拖长请求。
-            fix_response = llm.invoke(fix_messages)
-            fix_data = _parse_json(fix_response.content)
-
-            if fix_data and fix_data.get("fixed_code"):
-                current_code = fix_data["fixed_code"]
-                db_update_sp(sp["id"], code=current_code)
-
-        # 更新 SP 状态
-        db_update_sp(sp["id"], syntax_valid=1 if sp_result["syntax_ok"] else 0)
-        db_update_sp(sp["id"], business_valid=1 if sp_result["business_ok"] else 0)
-        sp_status = "verified" if sp_result["syntax_ok"] and sp_result["business_ok"] else "verify_failed"
-        db_update_sp(sp["id"], status=sp_status, verify_result=str(sp_result))
-        results.append(sp_result)
+        result["status"] = status
+        db_update_sp(
+            current["id"],
+            syntax_valid=1 if result["syntax_ok"] else 0,
+            business_valid=1 if result["business_ok"] else 0,
+            status=status,
+            verify_result=json.dumps(result, ensure_ascii=False),
+            validated_hash=result["bundle_hash"] if passed else None,
+        )
+        results.append(result)
+        all_pass = all_pass and passed
 
     return {
         "status": "verified" if all_pass else "verify_failed",
         "verify_results": results,
     }
-
-
-def deploy_check_node(state: AgentState, config: RunnableConfig | None = None) -> dict:
-    """部署预检节点 — 最终校验所有 SP。"""
-    all_pass = True
-    results = []
-    for sp in state.get("sp_list", []):
-        ok, err = check_syntax(sp["code"])
-        results.append({"sp_id": sp["id"], "name": sp["name"], "syntax_ok": ok, "error": err})
-        if not ok:
-            all_pass = False
-
-    if not all_pass:
-        interrupt({"type": "deploy_check", "pass": False, "results": results})
-
-    return {"status": "ready_to_deploy", "precheck_results": results}
-
-
-def deploy_node(state: AgentState, config: RunnableConfig | None = None) -> dict:
-    """部署节点 — 执行 CREATE PROCEDURE。"""
-    from app.db.sqlite import update_sp as db_update_sp
-    import datetime
-
-    results = []
-    for sp in state.get("sp_list", []):
-        ok, err = deploy_procedure(sp["name"], sp["code"])
-        if ok:
-            db_update_sp(sp["id"], status="deployed", deployed_at=datetime.datetime.now().isoformat())
-        results.append({"sp_id": sp["id"], "name": sp["name"], "success": ok, "error": err})
-
-    all_ok = all(r["success"] for r in results)
-    return {"status": "deployed" if all_ok else "deploy_failed", "deploy_results": results}

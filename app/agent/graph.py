@@ -3,7 +3,7 @@ from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 from app.agent.nodes import (
     AgentState, clarify_node, assumptions_node, design_node, generate_node,
-    verify_node, deploy_check_node, deploy_node,
+    verify_node,
 )
 
 # 模块级单例 MemorySaver — 确保状态在跨请求间持久
@@ -44,8 +44,6 @@ def _compile_graph() -> StateGraph:
     builder.add_node("plan", design_node)
     builder.add_node("generate", generate_node)
     builder.add_node("verify", verify_node)
-    builder.add_node("deploy_check", deploy_check_node)
-    builder.add_node("deploy", deploy_node)
 
     builder.set_entry_point("clarify")
 
@@ -63,10 +61,8 @@ def _compile_graph() -> StateGraph:
         "plan": "plan",
         "generate": "generate",
     })
-    builder.add_edge("generate", "verify")
+    builder.add_edge("generate", END)
     builder.add_edge("verify", END)
-    builder.add_edge("deploy_check", "deploy")
-    builder.add_edge("deploy", END)
 
     return builder.compile(checkpointer=_memory)
 

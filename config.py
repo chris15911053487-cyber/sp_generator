@@ -10,6 +10,7 @@ DEFAULT_CONFIG = {
     "db_user": "",
     "db_password": "",
     "db_database": "",
+    "db_environment": "test",
     "llm_api_key": "",
     "llm_base_url": "https://api.deepseek.com/v1",
     "llm_model_name": "deepseek-v4-pro",
@@ -74,6 +75,7 @@ def get_db_config() -> dict:
         "user": get_config("db_user"),
         "password": get_config("db_password"),
         "database": get_config("db_database"),
+        "environment": get_config("db_environment", "test"),
     }
 
 
