@@ -85,6 +85,19 @@ def test_verify_node_retries_execution_failure_once(monkeypatch):
     assert result["status"] == "verified"
 
 
+def test_output_projection_excludes_data_source_and_filters():
+    projection = nodes._extract_sp_output_projection(
+        "CREATE PROCEDURE sp_Test AS "
+        "SELECT DocNum AS 发票编号, DocTotal - PaidToDate AS 余额 "
+        "FROM OINV WHERE CANCELED = 'N'"
+    )
+
+    assert "发票编号" in projection
+    assert "余额" in projection
+    assert "OINV" not in projection
+    assert "WHERE" not in projection
+
+
 def test_generate_flows_to_verify_node():
     from app.agent.graph import create_graph
 

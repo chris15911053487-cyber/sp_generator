@@ -852,10 +852,12 @@
             for (const vr of vResults) {
                 const spName = escapeHtml(vr.sp_name || vr.sp_id || '?');
                 const synIcon = vr.syntax_ok ? '✅' : '❌';
-                const bizIcon = vr.business_ok ? '✅' : '❌';
+                const hasConfigError = (vr.details || []).some(d => d.type === 'configuration');
+                const bizIcon = hasConfigError ? '⚠️' : (vr.business_ok ? '✅' : '❌');
+                const bizLabel = hasConfigError ? '业务未判定（配置错误）' : '业务';
                 html += `<div class="verify-chat-card">`;
                 html += `<div class="verify-chat-title">📄 ${spName}</div>`;
-                html += `<div class="verify-chat-summary">${synIcon} 语法 &nbsp; ${bizIcon} 业务</div>`;
+                html += `<div class="verify-chat-summary">${synIcon} 语法 &nbsp; ${bizIcon} ${bizLabel}</div>`;
                 if (vr.details && vr.details.length > 0) {
                     html += '<div class="verify-chat-details">';
                     for (const d of vr.details) {
@@ -868,7 +870,7 @@
                             html += `<div class="vcd-row ${d.pass?'pass':'fail'}">${mark} ${escapeHtml(d.query||'')}: ${detail}</div>`;
                         } else if (!d.pass && d.error) {
                             const labels = {
-                                safety: '安全检查', execution: '执行错误', rollback: '回滚检查',
+                                safety: '安全检查', execution: '执行错误', rollback: '回滚检查', configuration: '校验配置错误',
                             };
                             const label = labels[d.type] || '校验错误';
                             html += `<div class="vcd-row fail">❌ ${label}: ${escapeHtml(String(d.error).substring(0,200))}</div>`;
@@ -1428,14 +1430,15 @@
         // 更新语法/业务图标
         const badges = spGroup.querySelectorAll('.sp-group-badges span');
         if (badges.length >= 2) {
+            const hasConfigError = (result.details || []).some(d => d.type === 'configuration');
             badges[0].textContent = '语法:' + (result.syntax_ok ? '✅' : '❌');
-            badges[1].textContent = '业务:' + (result.business_ok ? '✅' : '❌');
+            badges[1].textContent = '业务:' + (hasConfigError ? '⚠️' : (result.business_ok ? '✅' : '❌'));
         }
 
         // 更新校验 SQL 状态（遍历 details 中的 business 项）
         if (result.details) {
             for (const d of result.details) {
-                if (d.type === 'business' && d.query_id) {
+                if ((d.type === 'business' || d.type === 'configuration') && d.query_id) {
                     const vqStatus = document.getElementById('vq-status-' + d.query_id);
                     const vqIcon = document.getElementById('vq-icon-' + d.query_id);
                     const vqResult = document.getElementById('vq-result-' + d.query_id);
@@ -1479,8 +1482,10 @@
         if (!container) return;
 
         const synIcon = result.syntax_ok ? '✅' : '❌';
-        const bizIcon = result.business_ok ? '✅' : '❌';
-        let html = `<div class="spr-summary">${synIcon} 语法 &nbsp; ${bizIcon} 业务</div>`;
+        const hasConfigError = (result.details || []).some(d => d.type === 'configuration');
+        const bizIcon = hasConfigError ? '⚠️' : (result.business_ok ? '✅' : '❌');
+        const bizLabel = hasConfigError ? '业务未判定（配置错误）' : '业务';
+        let html = `<div class="spr-summary">${synIcon} 语法 &nbsp; ${bizIcon} ${bizLabel}</div>`;
         if (result.unsaved) {
             html += '<div class="spr-row fail">⚠️ 当前编辑内容尚未保存，本次结果不能用于部署</div>';
         }
@@ -1515,7 +1520,7 @@
                     html += `<div class="spr-row ${d.pass?'pass':'fail'}">${mark} ${escapeHtml(d.query||'')}: ${detail}</div>`;
                 } else if (!d.pass && d.error) {
                     const labels = {
-                        safety: '安全检查', execution: '执行错误', rollback: '回滚检查',
+                        safety: '安全检查', execution: '执行错误', rollback: '回滚检查', configuration: '校验配置错误',
                     };
                     const label = labels[d.type] || '校验错误';
                     html += `<div class="spr-row fail">❌ ${label}: ${escapeHtml(String(d.error).substring(0,300))}</div>`;

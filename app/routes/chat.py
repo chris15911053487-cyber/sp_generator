@@ -220,9 +220,11 @@ async def api_chat_stream(req: ChatRequest):
                                     for vr in v_results:
                                         sp_name = vr.get("sp_name", vr.get("sp_id", "")[:8])
                                         syn = "✅" if vr.get("syntax_ok") else "❌"
-                                        biz = "✅" if vr.get("business_ok") else "❌"
+                                        config_error = any(d.get("type") == "configuration" for d in vr.get("details", []))
+                                        biz = "⚠️" if config_error else ("✅" if vr.get("business_ok") else "❌")
+                                        biz_label = "业务未判定（配置错误）" if config_error else "业务"
                                         lines.append(f"📄 {sp_name}")
-                                        lines.append(f"   {syn} 语法  {biz} 业务")
+                                        lines.append(f"   {syn} 语法  {biz} {biz_label}")
                                         for d in vr.get("details", []):
                                             if d.get("type") == "syntax" and not d.get("pass"):
                                                 lines.append(f"   语法错误: {d.get('error', '')[:120]}")
@@ -235,7 +237,7 @@ async def api_chat_stream(req: ChatRequest):
                                             elif not d.get("pass") and d.get("error"):
                                                 label = {
                                                     "safety": "安全检查", "execution": "执行错误",
-                                                    "rollback": "回滚检查",
+                                                    "rollback": "回滚检查", "configuration": "校验配置错误",
                                                 }.get(d.get("type"), "校验错误")
                                                 lines.append(f"   ❌ {label}: {d['error'][:120]}")
                                 else:

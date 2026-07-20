@@ -118,6 +118,113 @@ def test_query_sp_is_executed_as_temporary_procedure_and_rolled_back(monkeypatch
     assert connection.closed is True
 
 
+@pytest.mark.parametrize(
+    ("operation", "expected"),
+    [
+        ("sum", 50),
+        ("count_rows", 4),
+        ("count_distinct", 2),
+        ("min", 10),
+        ("max", 20),
+        ("avg", 50 / 3),
+    ],
+)
+def test_aggregate_compares_transformed_detail_rows(operation, expected):
+    actual = [
+        {"发票总金额": 10},
+        {"发票总金额": 20},
+        {"发票总金额": 20},
+        {"发票总金额": None},
+    ]
+    aggregate = {"operation": operation, "output_column": "Metric"}
+    if operation != "count_rows":
+        aggregate["column"] = "发票总金额"
+    comparison = validation._compare_rows(
+        actual,
+        [{"Metric": expected}],
+        {
+            "mode": "aggregate",
+            "actual": aggregate,
+            "compare_columns": ["Metric"],
+            "tolerance": {"Metric": 0.000001},
+        },
+    )
+
+    assert comparison["match"] is True
+    assert comparison["actual_aggregate"]["operation"] == operation
+
+
+def test_keyed_rows_supports_actual_to_expected_column_mapping():
+    comparison = validation._compare_rows(
+        [{"发票编号": 1, "余额": 12.5}, {"发票编号": 2, "余额": 8}],
+        [{"DocNum": 1, "ExpectedBalance": 12.5}, {"DocNum": 2, "ExpectedBalance": 8}],
+        {
+            "mode": "keyed_rows",
+            "column_mapping": {
+                "发票编号": "DocNum",
+                "余额": "ExpectedBalance",
+            },
+            "key_columns": ["DocNum"],
+            "compare_columns": ["ExpectedBalance"],
+            "tolerance": {"ExpectedBalance": 0.01},
+        },
+    )
+
+    assert comparison["match"] is True
+
+
+def test_shape_or_column_contract_mismatch_is_configuration_error():
+    scalar = validation._compare_rows(
+        [{"X": 1}, {"X": 2}],
+        [{"X": 3}],
+        {"mode": "scalar", "compare_columns": ["X"]},
+    )
+    mapped = validation._compare_rows(
+        [{"发票编号": 1, "余额": 10}],
+        [{"DocNum": 1, "ExpectedBalance": 10}],
+        {
+            "mode": "keyed_rows",
+            "column_mapping": {"发票编号": "DocNum"},
+            "key_columns": ["DocNum"],
+            "compare_columns": [
+                {"actual": "不存在的列", "expected": "ExpectedBalance"},
+            ],
+        },
+    )
+
+    assert "configuration_error" in scalar
+    assert "configuration_error" in mapped
+
+
+def test_bundle_marks_contract_failure_as_configuration(monkeypatch):
+    connection = _Connection()
+    _database(monkeypatch, connection)
+    monkeypatch.setattr(
+        validation,
+        "_compare_rows",
+        lambda *_args: validation._contract_failure("规则与输出结构不匹配"),
+    )
+    sp = {
+        "id": "sp-1", "name": "sp_Total", "operation_type": "query",
+        "parameters": "[]",
+        "code": "CREATE PROCEDURE sp_Total AS SELECT 10 AS TotalAmount",
+    }
+    queries = [{
+        "id": "vq-1", "name": "配置检查",
+        "sql_code": "SELECT 10 AS TotalAmount",
+        "validation_spec": {
+            "mode": "scalar", "required": True,
+            "compare_columns": ["TotalAmount"],
+        },
+    }]
+
+    result = validation.validate_sp_bundle(sp, queries)
+
+    assert result["business_ok"] is False
+    assert result["details"][0]["type"] == "configuration"
+    assert result["details"][0]["error"] == "规则与输出结构不匹配"
+
+
 def test_write_sp_compares_deleted_rows_and_confirms_restore(monkeypatch):
     connection = _Connection(write=True)
     _database(monkeypatch, connection)

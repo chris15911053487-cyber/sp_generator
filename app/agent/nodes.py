@@ -650,6 +650,15 @@ def _parse_sp_params(code: str) -> list[dict]:
     return params
 
 
+def _extract_sp_output_projection(code: str) -> str:
+    """提取首个结果集的 SELECT 投影，不向 Oracle 生成阶段暴露 FROM/WHERE 实现。"""
+    match = re.search(r"\bSELECT\b([\s\S]*?)\bFROM\b", code, re.IGNORECASE)
+    if not match:
+        return "未能静态提取；必须依据已确认方案中的输出契约"
+    projection = "SELECT" + match.group(1)
+    return projection.strip()[:4000]
+
+
 def _parse_sql_placeholders(sql_code: str) -> set[str]:
     """从校验 SQL 中解析 {参数名} 占位符"""
     return set(re.findall(r'\{(\w+)\}', sql_code))
@@ -762,6 +771,7 @@ def _generate_verify_sql_for_sp(llm: ChatOpenAI, sp_row: dict, design: str, veri
 
     vq_prompt = VERIFY_SQL_PROMPT.format(
         sp_name=sp_row["name"],
+        sp_output_projection=_extract_sp_output_projection(sp_row.get("code", "")),
         design=design,
         verify_logic=verify_logic_text or "未提取到结构化校验逻辑；仅依据已确认设计生成，禁止参考 SP 实现。",
     )
@@ -899,7 +909,7 @@ def generate_node(state: AgentState, config: RunnableConfig | None = None) -> di
             if spec.get("required", True):
                 required_modes.add(spec.get("mode"))
         expected_modes = (
-            {"scalar", "keyed_rows"}
+            {"scalar", "aggregate", "keyed_rows"}
             if sp_row.get("operation_type", "query") == "query"
             else {"change_set"}
         )

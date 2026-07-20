@@ -197,6 +197,11 @@ VERIFY_SQL_PROMPT = """为以下存储过程生成业务校验 SQL。
 请仅依据已确认的业务方案、参数和输出契约生成独立 Oracle SQL。
 不要假设或复制存储过程内部实现。
 
+SP 输出投影（仅用于识别实际输出列名和别名）：
+{sp_output_projection}
+
+不得从该投影推断或复制数据来源、筛选条件和业务实现。
+
 方案上下文：
 {design}
 
@@ -209,7 +214,13 @@ VERIFY_SQL_PROMPT = """为以下存储过程生成业务校验 SQL。
 - 校验方式必须与上面描述的一致
 - 对比列必须与上面指定的一致
 - 不要增加额外的校验项，不要遗漏指定的校验项
-- 查询型 SP 至少生成一条 scalar 或 keyed_rows 直接结果对账
+- 查询型 SP 至少生成一条 scalar、aggregate 或 keyed_rows 直接结果对账
+- scalar 仅用于 SP 本身和校验 SQL 都恰好返回一行的情况
+- SP 返回明细、校验 SQL 返回 SUM/COUNT/AVG 等单行汇总时，必须使用 aggregate，禁止使用 scalar
+- aggregate 必须提供 actual.operation；除 count_rows 外还必须提供 actual.column，列名必须与 SP 输出别名完全一致
+- aggregate.actual.operation 只允许 sum、count_rows、count_distinct、min、max、avg
+- keyed_rows 的 key_columns 和 compare_columns 必须与两边真实输出列一致；列名不同时必须提供 column_mapping（SP输出列 → 校验SQL列）
+- 禁止把数据库源列名当作 SP 输出列名；必须以已确认方案中的 SP 输出契约为准
 - 写入型 SP 的每个“目标表 + 操作”必须各生成一条 change_set 规则
 - 每条 change_set 只能声明一个 affected_tables 对象，并包含 table、operation、key_columns、compare_columns 和 max_affected_rows
 - change_set 的 snapshot_sql 返回业务键和比较字段；sql_code 返回 Expected Change Set
@@ -223,13 +234,17 @@ VERIFY_SQL_PROMPT = """为以下存储过程生成业务校验 SQL。
     {{
       "name": "校验_XXX",
       "sql_code": "SELECT\\n    SUM(DocTotal) AS TotalAmount\\nFROM OINV\\nWHERE DocDate BETWEEN {{FromDate}} AND {{ToDate}}",
-      "compare_columns": "列名1,列名2",
+      "compare_columns": "TotalAmount",
       "validation_spec": {{
-        "mode": "scalar",
+        "mode": "aggregate",
         "required": true,
-        "key_columns": [],
-        "compare_columns": ["列名1", "列名2"],
-        "tolerance": {{"列名1": 0.01}}
+        "actual": {{
+          "operation": "sum",
+          "column": "SP输出金额列",
+          "output_column": "TotalAmount"
+        }},
+        "compare_columns": ["TotalAmount"],
+        "tolerance": {{"TotalAmount": 0.01}}
       }}
     }}
   ],

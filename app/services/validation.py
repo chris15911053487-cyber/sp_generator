@@ -12,7 +12,7 @@ from app.db.sqlserver import _serialize_value, check_syntax, get_connection
 from config import get_db_config, is_explicit_test_database
 
 ALLOWED_OPERATION_TYPES = {"query", "insert", "update", "delete", "mixed"}
-DIRECT_COMPARE_MODES = {"scalar", "keyed_rows"}
+DIRECT_COMPARE_MODES = {"scalar", "aggregate", "keyed_rows"}
 WRITE_COMPARE_MODE = "change_set"
 MAX_RESULT_ROWS = 50000
 QUERY_TIMEOUT_SECONDS = 60
@@ -374,12 +374,192 @@ def _values_equal(actual: Any, expected: Any, tolerance: Any = 0) -> bool:
         return str(actual).strip().lower() == str(expected).strip().lower()
 
 
+def _contract_failure(message: str) -> dict:
+    return {
+        "match": False,
+        "configuration_error": message,
+        "summary": f"校验配置错误: {message}",
+    }
+
+
+def _column_pairs(spec: dict, field: str) -> list[tuple[str, str]]:
+    items = spec.get(field) or []
+    if not isinstance(items, list) or not items:
+        raise ValidationError(f"{spec.get('mode', '校验')} 未指定 {field}")
+    mapping = spec.get("column_mapping") or {}
+    if not isinstance(mapping, dict):
+        raise ValidationError("column_mapping 必须是对象")
+
+    pairs = []
+    for item in items:
+        if isinstance(item, dict):
+            actual_name = item.get("actual")
+            expected_name = item.get("expected")
+        elif isinstance(item, str):
+            actual_name = item
+            expected_name = next(
+                (
+                    value for key, value in mapping.items()
+                    if str(key).lower() == item.lower()
+                ),
+                None,
+            )
+            if expected_name is None:
+                inverse = next(
+                    (
+                        key for key, value in mapping.items()
+                        if str(value).lower() == item.lower()
+                    ),
+                    None,
+                )
+                actual_name = inverse or item
+                expected_name = item
+        else:
+            raise ValidationError(f"{field} 的元素必须是列名或 actual/expected 对象")
+        if not isinstance(actual_name, str) or not isinstance(expected_name, str):
+            raise ValidationError(f"{field} 的 actual 和 expected 必须是列名")
+        pairs.append((actual_name, expected_name))
+    return pairs
+
+
+def _column_tolerance(tolerances: dict, actual_name: str, expected_name: str) -> Any:
+    return tolerances.get(expected_name, tolerances.get(actual_name, 0))
+
+
+def _aggregate_value(actual: list[dict], spec: dict) -> tuple[str, Any]:
+    aggregate = spec.get("actual") or {}
+    if not isinstance(aggregate, dict):
+        raise ValidationError("aggregate.actual 必须是对象")
+    operation = aggregate.get("operation")
+    allowed = {"sum", "count_rows", "count_distinct", "min", "max", "avg"}
+    if operation not in allowed:
+        raise ValidationError(
+            "aggregate.actual.operation 必须是 "
+            "sum/count_rows/count_distinct/min/max/avg"
+        )
+
+    compare_pairs = _column_pairs(spec, "compare_columns")
+    output_column = aggregate.get("output_column") or compare_pairs[0][0]
+    if not isinstance(output_column, str):
+        raise ValidationError("aggregate.actual.output_column 必须是列名")
+    if operation == "count_rows":
+        return output_column, len(actual)
+
+    source_column = aggregate.get("column")
+    if not isinstance(source_column, str) or not source_column:
+        raise ValidationError(f"aggregate {operation} 必须指定 actual.column")
+    values = [_find_value(row, source_column) for row in actual]
+    non_null = [value for value in values if value is not None]
+
+    if operation == "count_distinct":
+        markers = set()
+        for value in non_null:
+            try:
+                marker = ("number", Decimal(str(value)).normalize())
+            except (InvalidOperation, ValueError, TypeError):
+                marker = ("text", str(value).strip().lower())
+            markers.add(marker)
+        return output_column, len(markers)
+    if not non_null:
+        return output_column, None
+    if operation in {"sum", "avg"}:
+        try:
+            numbers = [Decimal(str(value)) for value in non_null]
+        except (InvalidOperation, ValueError, TypeError) as exc:
+            raise ValidationError(
+                f"aggregate {operation} 的源列 {source_column} 包含非数值"
+            ) from exc
+        value = sum(numbers)
+        if operation == "avg":
+            value /= len(numbers)
+        return output_column, _serialize_value(value)
+    try:
+        return output_column, min(non_null) if operation == "min" else max(non_null)
+    except TypeError as exc:
+        raise ValidationError(
+            f"aggregate {operation} 的源列 {source_column} 类型不一致"
+        ) from exc
+
+
+def _compare_aggregate(actual: list[dict], expected: list[dict], spec: dict) -> dict:
+    if len(expected) != 1:
+        return _contract_failure("aggregate 校验要求 Expected 返回一行")
+    try:
+        output_column, value = _aggregate_value(actual, spec)
+    except ValidationError as exc:
+        return _contract_failure(str(exc))
+    comparison_spec = dict(spec)
+    comparison_spec["compare_columns"] = [output_column]
+    comparison_spec.pop("column_mapping", None)
+    comparison = _compare_scalar([{output_column: value}], expected, comparison_spec)
+    comparison["actual_aggregate"] = {
+        "operation": (spec.get("actual") or {}).get("operation"),
+        "column": (spec.get("actual") or {}).get("column"),
+        "value": value,
+    }
+    return comparison
+
+
+def _compare_keyed_mapped(actual: list[dict], expected: list[dict], spec: dict) -> dict:
+    try:
+        key_pairs = _column_pairs(spec, "key_columns")
+        column_pairs = _column_pairs(spec, "compare_columns")
+        actual_map = {
+            tuple(_find_value(row, actual_name) for actual_name, _ in key_pairs): row
+            for row in actual
+        }
+        expected_map = {
+            tuple(_find_value(row, expected_name) for _, expected_name in key_pairs): row
+            for row in expected
+        }
+    except ValidationError as exc:
+        return _contract_failure(str(exc))
+    if len(actual_map) != len(actual) or len(expected_map) != len(expected):
+        return {"match": False, "summary": "结果中存在重复业务键"}
+
+    missing = sorted(set(expected_map) - set(actual_map), key=str)
+    extra = sorted(set(actual_map) - set(expected_map), key=str)
+    tolerances = spec.get("tolerance") or {}
+    differences = []
+    try:
+        for key in set(actual_map) & set(expected_map):
+            for actual_name, expected_name in column_pairs:
+                left = _find_value(actual_map[key], actual_name)
+                right = _find_value(expected_map[key], expected_name)
+                if not _values_equal(
+                    left,
+                    right,
+                    _column_tolerance(tolerances, actual_name, expected_name),
+                ):
+                    differences.append({
+                        "key": key,
+                        "column": expected_name,
+                        "actual_column": actual_name,
+                        "sp_value": left,
+                        "verify_value": right,
+                    })
+                    if len(differences) >= 100:
+                        break
+    except ValidationError as exc:
+        return _contract_failure(str(exc))
+
+    match = not missing and not extra and not differences
+    return {
+        "match": match,
+        "missing_keys": missing[:100],
+        "extra_keys": extra[:100],
+        "differences": differences[:100],
+        "summary": "数据一致" if match else
+                   f"缺失 {len(missing)}，多余 {len(extra)}，字段差异 {len(differences)}",
+    }
+
+
 def _compare_scalar(actual: list[dict], expected: list[dict], spec: dict) -> dict:
     if len(actual) != 1 or len(expected) != 1:
-        return {"match": False, "summary": "scalar 校验要求 Actual 和 Expected 各返回一行"}
+        return _contract_failure("scalar 校验要求 Actual 和 Expected 各返回一行")
     columns = spec.get("compare_columns") or []
     if not columns:
-        return {"match": False, "summary": "scalar 校验未指定 compare_columns"}
+        return _contract_failure("scalar 校验未指定 compare_columns")
     tolerances = spec.get("tolerance") or {}
     details = []
     for column in columns:
@@ -390,7 +570,7 @@ def _compare_scalar(actual: list[dict], expected: list[dict], spec: dict) -> dic
             details.append({"column": column, "sp_value": left,
                             "verify_value": right, "match": match})
         except ValidationError as exc:
-            details.append({"column": column, "match": False, "error": str(exc)})
+            return _contract_failure(str(exc))
     match = all(item["match"] for item in details)
     return {"match": match, "details": details,
             "summary": "数据一致" if match else "指标不一致"}
@@ -401,15 +581,31 @@ def _row_key(row: dict, columns: list[str]) -> tuple:
 
 
 def _compare_keyed(actual: list[dict], expected: list[dict], spec: dict) -> dict:
+    has_explicit_mapping = bool(spec.get("column_mapping")) or any(
+        isinstance(item, dict)
+        for field in ("key_columns", "compare_columns")
+        for item in (spec.get(field) or [])
+    )
+    if has_explicit_mapping:
+        return _compare_keyed_mapped(actual, expected, spec)
     keys = spec.get("key_columns") or []
     columns = spec.get("compare_columns") or []
     if not keys or not columns:
-        return {"match": False, "summary": "keyed_rows 缺少 key_columns 或 compare_columns"}
+        return _contract_failure("keyed_rows 缺少 key_columns 或 compare_columns")
+    try:
+        for row in actual[:1]:
+            for column in keys + columns:
+                _find_value(row, column)
+        for row in expected[:1]:
+            for column in keys + columns:
+                _find_value(row, column)
+    except ValidationError as exc:
+        return _contract_failure(str(exc))
     try:
         actual_map = {_row_key(row, keys): row for row in actual}
         expected_map = {_row_key(row, keys): row for row in expected}
     except ValidationError as exc:
-        return {"match": False, "summary": str(exc)}
+        return _contract_failure(str(exc))
     if len(actual_map) != len(actual) or len(expected_map) != len(expected):
         return {"match": False, "summary": "结果中存在重复业务键"}
     missing = sorted(set(expected_map) - set(actual_map), key=str)
@@ -440,13 +636,15 @@ def _compare_rows(actual: list[dict], expected: list[dict], spec: dict) -> dict:
     mode = spec.get("mode")
     if mode == "scalar":
         return _compare_scalar(actual, expected, spec)
+    if mode == "aggregate":
+        return _compare_aggregate(actual, expected, spec)
     if mode in {"keyed_rows", "change_set"}:
         return _compare_keyed(actual, expected, spec)
     if mode == "zero_rows":
         match = len(expected) == 0
         return {"match": match, "unexpected_rows": expected[:20],
                 "summary": "未发现异常" if match else f"发现 {len(expected)} 条异常"}
-    return {"match": False, "summary": f"不支持的比较模式: {mode}"}
+    return _contract_failure(f"不支持的比较模式: {mode}")
 
 
 def _rows_by_key(rows: list[dict], keys: list[str], label: str) -> dict:
@@ -537,7 +735,7 @@ def validate_sp_bundle(sp: dict, verify_queries: list[dict], params: dict | None
     }
 
     if not queries:
-        result["details"].append({"type": "business", "pass": False,
+        result["details"].append({"type": "configuration", "pass": False,
                                   "error": "没有校验 SQL，不能判定业务通过"})
         return result
     try:
@@ -563,8 +761,8 @@ def validate_sp_bundle(sp: dict, verify_queries: list[dict], params: dict | None
     }
     required_direct = DIRECT_COMPARE_MODES if operation_type == "query" else {WRITE_COMPARE_MODE}
     if not required_modes.intersection(required_direct):
-        label = "scalar/keyed_rows" if operation_type == "query" else "change_set"
-        result["details"].append({"type": "business", "pass": False,
+        label = "scalar/aggregate/keyed_rows" if operation_type == "query" else "change_set"
+        result["details"].append({"type": "configuration", "pass": False,
                                   "error": f"缺少必选的 {label} 直接对账规则"})
         return result
 
@@ -630,16 +828,19 @@ def validate_sp_bundle(sp: dict, verify_queries: list[dict], params: dict | None
                 expected = _run_query(cursor, query["sql_code"], params)
                 comparison = _compare_rows(actual_rows, expected, spec)
             passed = bool(comparison.get("match"))
+            configuration_error = comparison.get("configuration_error")
             if spec.get("required", True) and not passed:
                 all_required_pass = False
             result["details"].append({
-                "type": "business",
+                "type": "configuration" if configuration_error else "business",
                 "query_id": query.get("id"),
                 "query": query.get("name", "未命名校验"),
                 "pass": passed,
                 "comparison": comparison,
                 "data": expected[:10],
             })
+            if configuration_error:
+                result["details"][-1]["error"] = configuration_error
 
         result["business_ok"] = all_required_pass
     except Exception as exc:
