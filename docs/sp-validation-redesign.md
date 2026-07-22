@@ -4,6 +4,20 @@
 > 状态：已实施（首期最小改造）
 > 适用范围：SQL Server 测试数据库；生成的 SP 可以是查询型，也可以包含 INSERT、UPDATE、DELETE
 
+## 2026-07-21 Harness 加固说明
+
+首期“逐个保存草稿后校验”的生成语义已被生成 harness 取代：已确认设计先编译为一个 QuerySpec，再绑定实时 SchemaEvidence；SP 与独立 Oracle 只作为内存 CandidateBundle 生成。安全、Schema、编译、契约和回滚业务闸门全部通过后，整批制品才在一个 SQLite 事务中替换。
+
+因此，第 4.1 节保留为首期历史说明，不再代表当前 Agent 生成主路径。当前规则是：
+
+- 候选生成和修复期间不写 `stored_procedures` 或 `verify_queries`；
+- 任一 SP 失败或进入 `needs_review`，旧整套制品保持不变；
+- 自动修复最多两轮且不得改变 QuerySpec 不变量；
+- 保存的 QuerySpec、Schema 指纹和 bundle 哈希共同绑定验证版本；
+- 部署前重新捕获 Schema 指纹并核对 bundle 哈希。
+
+SQL Server 静态编译保证与真实集成探针边界见 `docs/sqlserver-validation-capabilities.md`。
+
 ## 1. 目标与原则
 
 本次改造把“保存草稿”“完整校验”“正式部署”明确分离。

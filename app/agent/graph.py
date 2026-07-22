@@ -31,9 +31,18 @@ def _after_assumptions(state: AgentState) -> str:
 
 def _after_design(state: AgentState) -> str:
     """设计阶段后续路由：用户确认 → 进入生成；用户反馈 → 回到设计。"""
+    if state.get("error"):
+        return "end"
     if state.get("mode") == "design":
         return "plan"
     return "generate"
+
+
+def _after_generate(state: AgentState) -> str:
+    """仅在本次生成完整成功后进入数据库校验。"""
+    if state.get("status") == "candidate_generated" and not state.get("error"):
+        return "verify"
+    return "end"
 
 
 def _compile_graph() -> StateGraph:
@@ -60,8 +69,12 @@ def _compile_graph() -> StateGraph:
     builder.add_conditional_edges("plan", _after_design, {
         "plan": "plan",
         "generate": "generate",
+        "end": END,
     })
-    builder.add_edge("generate", "verify")
+    builder.add_conditional_edges("generate", _after_generate, {
+        "verify": "verify",
+        "end": END,
+    })
     builder.add_edge("verify", END)
 
     return builder.compile(checkpointer=_memory)

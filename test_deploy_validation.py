@@ -1,4 +1,6 @@
 """部署资格必须绑定最近一次业务校验通过的完整版本。"""
+import json
+
 import pytest
 
 from app.routes import deploy
@@ -15,8 +17,32 @@ def _fixture():
         "id": "sp-1", "name": "sp_Test",
         "code": "CREATE PROCEDURE sp_Test AS SELECT 1 AS X",
         "parameters": "[]", "operation_type": "query", "business_valid": 1,
+        "query_spec_json": json.dumps({
+            "design_version": "v1",
+            "procedures": [{
+                "name": "sp_Test", "purpose": "返回测试值",
+                "operation_type": "reporting", "parameters": [],
+                "sources": [{
+                    "schema": "dbo", "table": "TestSource",
+                    "alias": "source", "role": "测试来源",
+                }],
+                "joins": [], "filters": [], "grain": [],
+                "outputs": [{
+                    "name": "X", "meaning": "测试值",
+                    "source_columns": [{"source_alias": "source", "column": "X"}],
+                    "aggregation": None, "sql_type": "INT",
+                }],
+                "writes": [],
+                "verification_rules": [{
+                    "name": "对账", "mode": "scalar",
+                    "required_columns": ["X"], "description": "直接对账",
+                }],
+            }],
+        }, ensure_ascii=False),
+        "schema_fingerprint": "a" * 64,
     }
     sp["validated_hash"] = compute_bundle_hash(sp, queries)
+    sp["bundle_hash"] = sp["validated_hash"]
     return sp, queries
 
 
@@ -25,7 +51,14 @@ def _test_database(monkeypatch):
         deploy, "get_db_config",
         lambda: {"database": "TestDB", "environment": "test"},
     )
-
+    monkeypatch.setattr(
+        deploy,
+        "capture_schema_evidence",
+        lambda _spec: type("Evidence", (), {
+            "fingerprint": "a" * 64,
+            "unresolved": [],
+        })(),
+    )
 
 def test_deploy_check_accepts_exact_validated_version(monkeypatch):
     _test_database(monkeypatch)
@@ -279,3 +312,139 @@ def test_write_execution_requires_explicit_test_environment(monkeypatch):
 
     assert response["ok"] is False
     assert response["environment_required"] is True
+
+
+def test_deploy_check_requires_revalidation_after_schema_change(monkeypatch):
+    _test_database(monkeypatch)
+    sp, queries = _fixture()
+    monkeypatch.setattr(deploy, "get_sps", lambda _session_id: [sp])
+    monkeypatch.setattr(deploy, "get_verify_queries", lambda _sp_id: queries)
+    monkeypatch.setattr(deploy, "check_syntax", lambda _code: (True, ""))
+    monkeypatch.setattr(
+        deploy,
+        "capture_schema_evidence",
+        lambda _spec: type("Evidence", (), {
+            "fingerprint": "b" * 64,
+            "unresolved": [],
+        })(),
+    )
+
+    ready, results, _ = deploy._readiness("session-1")
+
+    assert ready is False
+    assert results[0]["revalidation_required"] is True
+    assert "Schema 已变化" in results[0]["error"]
+
+
+def test_deploy_check_rejects_changed_audit_bundle_hash(monkeypatch):
+    _test_database(monkeypatch)
+    sp, queries = _fixture()
+    sp["bundle_hash"] = "tampered"
+    monkeypatch.setattr(deploy, "get_sps", lambda _session_id: [sp])
+    monkeypatch.setattr(deploy, "get_verify_queries", lambda _sp_id: queries)
+    monkeypatch.setattr(deploy, "check_syntax", lambda _code: (True, ""))
+
+    ready, results, _ = deploy._readiness("session-1")
+
+    assert ready is False
+    assert "审计哈希不一致" in results[0]["error"]
+
+
+def test_invalid_manual_save_does_not_overwrite_current_version(monkeypatch):
+    from app.routes import verify
+
+    stored, queries = _fixture()
+    before = json.dumps({"sp": stored, "queries": queries}, sort_keys=True)
+    monkeypatch.setattr(verify, "get_sp", lambda _sp_id: dict(stored))
+    monkeypatch.setattr(
+        verify,
+        "get_verify_queries",
+        lambda _sp_id: [dict(item) for item in queries],
+    )
+    monkeypatch.setattr(
+        verify,
+        "validate_sp_bundle",
+        lambda *_args, **_kwargs: {
+            "syntax_ok": False,
+            "business_ok": False,
+            "bundle_hash": "invalid",
+            "details": [{"type": "syntax", "pass": False, "error": "bad sql"}],
+        },
+    )
+    monkeypatch.setattr(
+        verify,
+        "save_sp_bundle",
+        lambda *_args, **_kwargs: pytest.fail("无效候选不得保存"),
+    )
+    monkeypatch.setattr(
+        verify,
+        "update_sp",
+        lambda *_args, **_kwargs: pytest.fail("无效候选不得覆盖状态"),
+    )
+
+    response = verify._verify(
+        stored["id"],
+        verify.VerifySpRequest(code="INVALID SQL", save=True),
+    )
+
+    assert response["result"]["unsaved"] is True
+    assert response["result"]["status"] == "verify_failed"
+    assert json.dumps({"sp": stored, "queries": queries}, sort_keys=True) == before
+
+
+def test_validated_manual_bundle_is_saved_with_status_in_one_transaction(
+    tmp_path, monkeypatch,
+):
+    from app.db import sqlite as sqlite_db
+
+    db_path = tmp_path / "manual.db"
+    monkeypatch.setattr(sqlite_db, "DB_PATH", str(db_path))
+    sqlite_db.init_db()
+    session = sqlite_db.create_session("manual")
+    template, _ = _fixture()
+    stored = sqlite_db.save_sp(
+        session["id"],
+        template["name"],
+        "CREATE PROCEDURE sp_Test AS SELECT 0 AS X",
+    )
+    query = sqlite_db.save_verify_query(
+        stored["id"],
+        "对账",
+        "SELECT 1 AS X",
+        "X",
+        json.dumps({"mode": "scalar", "compare_columns": ["X"]}),
+    )
+    sqlite_db.update_sp(
+        stored["id"],
+        query_spec_json=template["query_spec_json"],
+        schema_fingerprint=template["schema_fingerprint"],
+    )
+    candidate = sqlite_db.get_sp(stored["id"])
+    candidate["code"] = "CREATE PROCEDURE sp_Test AS SELECT 1 AS X"
+    queries = [dict(query)]
+    bundle_hash = compute_bundle_hash(candidate, queries)
+    result = {
+        "syntax_ok": True,
+        "business_ok": True,
+        "bundle_hash": bundle_hash,
+        "status": "verified",
+        "details": [{
+            "query_id": query["id"], "query": "对账", "pass": True,
+        }],
+    }
+
+    saved = sqlite_db.save_sp_bundle(
+        stored["id"],
+        candidate["code"],
+        candidate["parameters"],
+        candidate["operation_type"],
+        queries,
+        validation_result=result,
+    )
+    saved_query = sqlite_db.get_verify_queries(stored["id"])[0]
+
+    assert saved["code"] == candidate["code"]
+    assert saved["status"] == "verified"
+    assert saved["validated_hash"] == bundle_hash
+    assert saved["bundle_hash"] == bundle_hash
+    assert saved_query["status"] == "pass"

@@ -13,11 +13,11 @@ body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-
 main { display: flex; flex: 1; overflow: hidden; }
 
 /* ====== Chat Panel ====== */
-#chat-panel { flex: 0 0 50%; width: 50%; display: flex; flex-direction: column; }
+#chat-panel { flex: 0 0 50%; width: 50%; min-width: 0; display: flex; flex-direction: column; }
 #chat-messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
 #chat-messages .message { max-width: 80%; padding: 10px 14px; border-radius: 12px; line-height: 1.5; font-size: 14px; word-break: break-word; }
 #chat-messages .user { align-self: flex-end; background: #6c5ce7; color: #fff; white-space: pre-wrap; }
-#chat-messages .assistant { align-self: flex-start; background: #fff; border: 1px solid #dfe6e9; }
+#chat-messages .assistant { align-self: stretch; width: 100%; max-width: 100%; min-width: 0; background: #fff; border: 1px solid #dfe6e9; }
 #chat-messages .system { align-self: center; font-size: 12px; color: #636e72; white-space: pre-wrap; }
 #chat-messages .error { align-self: flex-start; background: #ff7675; color: #fff; }
 
@@ -27,12 +27,13 @@ main { display: flex; flex: 1; overflow: hidden; }
 .message.assistant ul, .message.assistant ol { margin: 4px 0 8px; padding-left: 20px; }
 .message.assistant li { margin: 2px 0; }
 .message.assistant code { background: #f0f0f5; padding: 2px 6px; border-radius: 3px; font-size: 13px; font-family: "Cascadia Code", "Fira Code", Consolas, monospace; }
-.message.assistant pre { background: #2d3436; color: #dfe6e9; padding: 10px 14px; border-radius: 6px; overflow-x: auto; margin: 8px 0; font-size: 13px; line-height: 1.5; }
+.message.assistant pre { background: #2d3436; color: #dfe6e9; padding: 10px 14px; border-radius: 6px; overflow-x: hidden; margin: 8px 0; font-size: 13px; line-height: 1.5; white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
 .message.assistant pre code { background: none; padding: 0; border-radius: 0; font-size: inherit; color: inherit; }
 .message.assistant blockquote { border-left: 3px solid #6c5ce7; padding: 4px 12px; margin: 8px 0; color: #636e72; background: #f8f9fc; border-radius: 0 4px 4px 0; }
-.message.assistant table { border-collapse: collapse; margin: 8px 0; font-size: 13px; width: 100%; }
-.message.assistant th, .message.assistant td { border: 1px solid #dfe6e9; padding: 6px 10px; text-align: left; }
-.message.assistant th { background: #f5f6fa; font-weight: 600; }
+.markdown-table-wrap { max-width: 100%; overflow-x: auto; margin: 8px 0; }
+.message.assistant table { border-collapse: collapse; margin: 0; font-size: 13px; width: 100%; min-width: 620px; }
+.message.assistant th, .message.assistant td { border: 1px solid #dfe6e9; padding: 6px 10px; text-align: left; vertical-align: top; word-break: normal; overflow-wrap: break-word; }
+.message.assistant th { background: #f5f6fa; font-weight: 600; white-space: nowrap; }
 .message.assistant h1, .message.assistant h2, .message.assistant h3, .message.assistant h4 { margin: 12px 0 6px; font-weight: 600; }
 .message.assistant h1 { font-size: 18px; }
 .message.assistant h2 { font-size: 16px; }
@@ -75,7 +76,7 @@ main { display: flex; flex: 1; overflow: hidden; }
 }
 
 /* ====== Right Panel ====== */
-#right-panel { flex: 0 0 50%; width: 50%; padding: 16px; overflow-y: auto; display: flex; flex-direction: column; }
+#right-panel { flex: 0 0 50%; width: 50%; min-width: 0; padding: 16px; overflow-y: auto; display: flex; flex-direction: column; }
 #right-panel h2 { font-size: 14px; color: #636e72; margin: 0 0 8px; padding-bottom: 4px; border-bottom: 1px solid #dfe6e9; }
 #right-panel h2:first-child { margin-top: 0; }
 
@@ -327,7 +328,10 @@ main { display: flex; flex: 1; overflow: hidden; }
     color: #dfe6e9;
     padding: 12px;
     border-radius: 6px;
-    overflow-x: auto;
+    overflow-x: hidden;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    word-break: break-word;
     font-size: 13px;
     margin: 8px 0;
 }
@@ -338,8 +342,9 @@ main { display: flex; flex: 1; overflow: hidden; }
 }
 .design-content table {
     width: 100%;
+    min-width: 620px;
     border-collapse: collapse;
-    margin: 8px 0;
+    margin: 0;
     font-size: 13px;
 }
 .design-content th,
@@ -347,10 +352,14 @@ main { display: flex; flex: 1; overflow: hidden; }
     border: 1px solid #dfe6e9;
     padding: 6px 10px;
     text-align: left;
+    vertical-align: top;
+    word-break: normal;
+    overflow-wrap: break-word;
 }
 .design-content th {
     background: #edf2f7;
     font-weight: 600;
+    white-space: nowrap;
 }
 .design-hint {
     padding: 8px 16px;
@@ -390,6 +399,7 @@ main { display: flex; flex: 1; overflow: hidden; }
 }
 .verify-table {
     width: 100%;
+    min-width: 620px;
     border-collapse: collapse;
     font-size: 12px;
     background: #fff;

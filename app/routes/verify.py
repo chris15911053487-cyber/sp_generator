@@ -71,10 +71,15 @@ def _persist_result(sp: dict, queries: list[dict], result: dict) -> None:
         status=status,
         verify_result=json.dumps(result, ensure_ascii=False),
         validated_hash=result["bundle_hash"] if all_pass else None,
+        bundle_hash=result["bundle_hash"] if all_pass else None,
     )
     detail_by_id = {
         detail.get("query_id"): detail
         for detail in result.get("details", []) if detail.get("query_id")
+    }
+    detail_by_name = {
+        detail.get("query"): detail
+        for detail in result.get("details", []) if detail.get("query")
     }
     global_failure = next(
         (
@@ -85,7 +90,11 @@ def _persist_result(sp: dict, queries: list[dict], result: dict) -> None:
     )
     for query in queries:
         query_id = query.get("id")
-        detail = detail_by_id.get(query_id) or global_failure
+        detail = (
+            detail_by_id.get(query_id)
+            or detail_by_name.get(query.get("name"))
+            or global_failure
+        )
         if not query_id or detail is None:
             continue
         update_verify_query(
@@ -109,18 +118,29 @@ def _verify(sp_id: str, req: VerifySpRequest) -> dict:
         candidate["operation_type"] = req.operation_type
     candidate["parameters"] = _params_with_defaults(candidate, params)
 
+    result = validate_sp_bundle(candidate, queries, params)
+
     if req.save:
-        save_sp_bundle(
+        if not (result["syntax_ok"] and result["business_ok"]):
+            result["unsaved"] = True
+            result["deployment_eligible"] = False
+            result["status"] = "verify_failed"
+            return {"ok": True, "result": result}
+        result["status"] = (
+            "deployed"
+            if stored.get("deployed_hash") == result["bundle_hash"]
+            else "verified"
+        )
+        saved = save_sp_bundle(
             sp_id,
             candidate["code"],
             candidate["parameters"],
             candidate.get("operation_type") or "query",
             queries,
+            validation_result=result,
         )
-        candidate = get_sp(sp_id)
-        queries = get_verify_queries(sp_id)
-
-    result = validate_sp_bundle(candidate, queries, params)
+        result["deployment_eligible"] = bool(saved.get("validated_hash"))
+        return {"ok": True, "result": result}
 
     saved = get_sp(sp_id)
     saved_queries = get_verify_queries(sp_id)
@@ -169,7 +189,7 @@ def api_update_verify_query(query_id: str, req: UpdateVqRequest):
         return {"ok": False, "message": "校验 SQL 不存在"}
     update_verify_query(query_id, **changes, status="pending", result_detail=None)
     update_sp(row["sp_id"], status="draft", syntax_valid=0, business_valid=0,
-              validated_hash=None, verify_result=None)
+              validated_hash=None, bundle_hash=None, verify_result=None)
     return {"ok": True}
 
 

@@ -2,6 +2,7 @@
 import decimal
 import datetime
 import re
+import uuid
 import pyodbc
 from config import get_db_config
 
@@ -50,10 +51,11 @@ def execute_query(sql: str) -> list[dict]:
 
 
 def check_syntax(sql: str) -> tuple[bool, str]:
-    """用 SET PARSEONLY ON 检查 SQL 语法。返回 (通过, 错误信息)。
+    """检查 SQL 语法；存储过程还会创建本地临时过程以绑定真实对象。
 
     对 ALTER PROCEDURE 做兼容处理：如果 SP 在服务器上不存在，
-    临时将 ALTER 转为 CREATE 来做语法检查（仅检查语法，不实际执行）。
+    临时将 ALTER 转为 CREATE 来做语法检查。临时过程随连接关闭自动删除，
+    不会执行过程主体，也不会在业务库留下对象。
     """
     conn = get_connection()
     cursor = conn.cursor()
@@ -79,6 +81,19 @@ def check_syntax(sql: str) -> tuple[bool, str]:
         cursor.execute("SET PARSEONLY ON")
         cursor.execute(sql_to_check)
         cursor.execute("SET PARSEONLY OFF")
+        if re.match(
+            r'(?is)^\s*(?:CREATE\s+OR\s+ALTER|CREATE|ALTER)\s+PROC(?:EDURE)?\b',
+            sql_to_check,
+        ):
+            temp_name = "#compile_" + uuid.uuid4().hex[:16]
+            compile_code = re.sub(
+                r'(?is)^\s*(?:CREATE\s+OR\s+ALTER|CREATE|ALTER)\s+PROC(?:EDURE)?\s+'
+                r'(?:\[[^\]]+\]|[A-Za-z_][\w$#]*)(?:\.(?:\[[^\]]+\]|[A-Za-z_][\w$#]*))?',
+                f"CREATE PROCEDURE {temp_name}",
+                sql_to_check,
+                count=1,
+            )
+            cursor.execute(compile_code)
         conn.close()
         return True, ""
     except Exception as e:
@@ -120,6 +135,202 @@ def _deployable_code(name: str, code: str) -> str:
         r'(?is)^\s*(?:CREATE\s+OR\s+ALTER|CREATE|ALTER)\s+PROC(?:EDURE)?',
         'CREATE OR ALTER PROCEDURE', code, count=1,
     )
+
+
+def check_procedure_references(name: str, code: str) -> tuple[bool, str]:
+    """校验记录名称、过程定义，并让 SQL Server 绑定真实表和字段。"""
+    try:
+        prepared = _deployable_code(name, code)
+    except ValueError as exc:
+        return False, str(exc)
+    return check_syntax(prepared)
+
+
+def _described_columns(rows) -> list[dict]:
+    return [
+        {
+            "name": row[2],
+            "sql_type": row[5],
+            "nullable": bool(row[3]),
+        }
+        for row in rows
+        if len(row) > 5 and not bool(row[0])
+    ]
+
+
+def describe_query_references(
+    sql: str,
+    parameter_defs: list[dict] | None = None,
+) -> dict:
+    """用 sp_describe_first_result_set 静态绑定查询并返回结果元数据。"""
+    parameter_defs = parameter_defs or []
+    definitions = {
+        str(item.get("name", "")).lstrip("@").lower(): item
+        for item in parameter_defs
+        if isinstance(item, dict) and item.get("name")
+    }
+    placeholders = []
+
+    def replace_placeholder(match: re.Match) -> str:
+        name = match.group(1)
+        if name.lower() not in {item.lower() for item in placeholders}:
+            placeholders.append(name)
+        return f"@{name}"
+
+    statement = re.sub(r"\{(\w+)\}", replace_placeholder, sql)
+    declarations = []
+    for name in placeholders:
+        item = definitions.get(name.lower(), {})
+        data_type = str(item.get("type", "NVARCHAR(MAX)")).strip().upper()
+        if not re.fullmatch(
+            r"[A-Z][A-Z0-9_]*(?:\((?:MAX|\d+)(?:\s*,\s*\d+)?\))?",
+            data_type,
+        ):
+            data_type = "NVARCHAR(MAX)"
+        declarations.append(f"@{name} {data_type}")
+
+    conn = None
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "EXEC sys.sp_describe_first_result_set "
+            "@tsql = ?, @params = ?, @browse_information_mode = 0",
+            statement,
+            ", ".join(declarations) if declarations else None,
+        )
+        return {
+            "ok": True,
+            "error": "",
+            "code": "",
+            "executed": False,
+            "method": "sp_describe_first_result_set",
+            "result_columns": _described_columns(cursor.fetchall()),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": str(exc),
+            "code": _sql_error_code(exc),
+            "executed": False,
+            "method": "sp_describe_first_result_set",
+            "result_columns": [],
+        }
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def check_query_references(
+    sql: str,
+    parameter_defs: list[dict] | None = None,
+) -> tuple[bool, str]:
+    result = describe_query_references(sql, parameter_defs)
+    return result["ok"], result["error"]
+
+
+def _sql_error_code(exc: Exception) -> str:
+    text = str(exc)
+    match = re.search(r"\b(?:SQL Server\]\[)?(\d{3,5})\b", text)
+    return match.group(1) if match else exc.__class__.__name__
+
+
+def compile_candidate(artifact: str, name: str, sql: str,
+                      parameter_defs: list[dict] | None = None) -> dict:
+    """静态编译候选，不执行过程主体或 Oracle 查询。"""
+    parameter_defs = parameter_defs or []
+    if artifact == "oracle":
+        return describe_query_references(sql, parameter_defs)
+    if artifact != "procedure":
+        return {
+            "ok": False,
+            "error": f"不支持的候选类型: {artifact}",
+            "code": "unsupported_artifact",
+            "executed": False,
+        }
+
+    try:
+        prepared = _deployable_code(name, sql)
+    except ValueError as exc:
+        return {
+            "ok": False, "error": str(exc), "code": "invalid_definition",
+            "executed": False,
+        }
+
+    temp_name = "#compile_" + uuid.uuid4().hex[:16]
+    compile_code = re.sub(
+        r'(?is)^\s*(?:CREATE\s+OR\s+ALTER|CREATE|ALTER)\s+PROC(?:EDURE)?\s+'
+        r'(?:\[[^\]]+\]|[A-Za-z_][\w$#]*)(?:\.(?:\[[^\]]+\]|[A-Za-z_][\w$#]*))?',
+        f"CREATE PROCEDURE {temp_name}",
+        prepared,
+        count=1,
+    )
+    arguments = []
+    for item in parameter_defs:
+        parameter = str(item.get("name") or "").strip()
+        if not re.fullmatch(r"@[A-Za-z_][A-Za-z0-9_]*", parameter):
+            return {
+                "ok": False,
+                "error": f"非法参数名: {parameter}",
+                "code": "invalid_parameter",
+                "executed": False,
+            }
+        arguments.append(f"{parameter} = NULL")
+    execute_statement = f"EXEC {temp_name}"
+    if arguments:
+        execute_statement += " " + ", ".join(arguments)
+
+    conn = None
+    showplan_on = False
+    try:
+        conn = get_connection(autocommit=True)
+        cursor = conn.cursor()
+        cursor.execute(compile_code)
+        cursor.execute("SET SHOWPLAN_XML ON")
+        showplan_on = True
+        cursor.execute(execute_statement)
+        if cursor.description:
+            cursor.fetchall()
+        cursor.execute("SET SHOWPLAN_XML OFF")
+        showplan_on = False
+        cursor.execute(
+            "EXEC sys.sp_describe_first_result_set "
+            "@tsql = ?, @params = NULL, @browse_information_mode = 0",
+            execute_statement,
+        )
+        result_columns = _described_columns(cursor.fetchall())
+        cursor.execute(f"DROP PROCEDURE {temp_name}")
+        return {
+            "ok": True,
+            "error": "",
+            "code": "",
+            "executed": False,
+            "method": "temporary_procedure_showplan_xml",
+            "result_columns": result_columns,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": str(exc),
+            "code": _sql_error_code(exc),
+            "executed": False,
+            "method": "temporary_procedure_showplan_xml",
+            "result_columns": [],
+        }
+    finally:
+        if conn is not None:
+            cursor = conn.cursor()
+            if showplan_on:
+                try:
+                    cursor.execute("SET SHOWPLAN_XML OFF")
+                except Exception:
+                    pass
+            try:
+                cursor.execute(f"DROP PROCEDURE {temp_name}")
+            except Exception:
+                pass
+            conn.close()
+
 
 
 def deploy_procedures_atomically(procedures: list[dict]) -> list[dict]:
@@ -173,6 +384,177 @@ def get_tables() -> list[str]:
         "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE'"
     )
     return [r["TABLE_NAME"] for r in rows]
+
+
+def read_schema_objects(object_refs: list[tuple[str, str]]) -> dict:
+    """只从系统目录读取指定对象的结构，不读取任何业务行。"""
+    requested = sorted(set(object_refs))
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT DB_NAME()")
+        database_row = cursor.fetchone()
+        database_name = str(database_row[0]) if database_row else ""
+
+        cursor.execute("""
+            SELECT s.name, o.name, o.object_id, o.type
+            FROM sys.objects o
+            JOIN sys.schemas s ON s.schema_id = o.schema_id
+            WHERE o.type IN ('U', 'V')
+            ORDER BY s.name, o.name
+        """)
+        catalog = list(cursor.fetchall())
+        available_objects = [
+            f"{schema_name}.{object_name}"
+            for schema_name, object_name, _object_id, _object_type in catalog
+        ]
+        requested_set = set(requested)
+        selected = [
+            row for row in catalog
+            if (str(row[0]), str(row[1])) in requested_set
+        ]
+        if not selected:
+            return {
+                "database_name": database_name,
+                "objects": [],
+                "available_objects": available_objects,
+            }
+
+        object_ids = [row[2] for row in selected]
+        placeholders = ",".join("?" for _ in object_ids)
+        cursor.execute(f"""
+            SELECT
+                s.name,
+                o.name,
+                c.name,
+                ty.name,
+                c.max_length,
+                c.precision,
+                c.scale,
+                c.is_nullable,
+                CONVERT(nvarchar(4000), ep.value)
+            FROM sys.objects o
+            JOIN sys.schemas s ON s.schema_id = o.schema_id
+            JOIN sys.columns c ON c.object_id = o.object_id
+            JOIN sys.types ty ON ty.user_type_id = c.user_type_id
+            LEFT JOIN sys.extended_properties ep
+              ON ep.major_id = o.object_id
+             AND ep.minor_id = c.column_id
+             AND ep.name = 'MS_Description'
+            WHERE o.object_id IN ({placeholders})
+            ORDER BY s.name, o.name, c.column_id
+        """, *object_ids)
+        grouped = {
+            (str(schema_name), str(object_name)): []
+            for schema_name, object_name, _object_id, _object_type in selected
+        }
+        for row in cursor.fetchall():
+            grouped[(str(row[0]), str(row[1]))].append({
+                "name": str(row[2]),
+                "sql_type": str(row[3]),
+                "max_length": row[4],
+                "precision": row[5],
+                "scale": row[6],
+                "nullable": bool(row[7]),
+                "description": str(row[8]) if row[8] is not None else None,
+            })
+
+        object_types = {"U": "table", "V": "view"}
+        objects = [{
+            "schema": str(schema_name),
+            "name": str(object_name),
+            "object_type": object_types.get(str(object_type), str(object_type)),
+            "columns": grouped[(str(schema_name), str(object_name))],
+        } for schema_name, object_name, _object_id, object_type in selected]
+        return {
+            "database_name": database_name,
+            "objects": objects,
+            "available_objects": available_objects,
+        }
+    finally:
+        conn.close()
+
+
+
+def get_schema_context(source_text: str, max_tables: int = 12) -> str:
+    """返回输入中提及表的实时字段清单，供生成与修复共同使用。"""
+    conn = get_connection()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT s.name, o.name, o.object_id
+            FROM sys.objects o
+            JOIN sys.schemas s ON s.schema_id = o.schema_id
+            WHERE o.type IN ('U', 'V')
+            ORDER BY s.name, o.name
+        """)
+        objects = cursor.fetchall()
+        normalized_text = source_text.replace("[", "").replace("]", "").lower()
+        matched = []
+        for schema_name, table_name, object_id in objects:
+            pattern = rf"(?<![\w$#]){re.escape(str(table_name).lower())}(?![\w$#])"
+            hit = re.search(pattern, normalized_text)
+            if hit:
+                matched.append((hit.start(), schema_name, table_name, object_id))
+        matched.sort(key=lambda item: item[0])
+        matched = matched[:max_tables]
+        if not matched:
+            return "当前输入未匹配到该数据库中的真实表；不得据此编造表名或字段名。"
+
+        object_ids = [item[3] for item in matched]
+        placeholders = ",".join("?" for _ in object_ids)
+        cursor.execute(f"""
+            SELECT
+                s.name AS schema_name,
+                o.name AS table_name,
+                c.name AS column_name,
+                ty.name AS data_type,
+                c.max_length,
+                c.precision,
+                c.scale,
+                c.is_nullable,
+                CONVERT(nvarchar(4000), ep.value) AS description
+            FROM sys.objects o
+            JOIN sys.schemas s ON s.schema_id = o.schema_id
+            JOIN sys.columns c ON c.object_id = o.object_id
+            JOIN sys.types ty ON ty.user_type_id = c.user_type_id
+            LEFT JOIN sys.extended_properties ep
+              ON ep.major_id = o.object_id
+             AND ep.minor_id = c.column_id
+             AND ep.name = 'MS_Description'
+            WHERE o.object_id IN ({placeholders})
+            ORDER BY s.name, o.name, c.column_id
+        """, *object_ids)
+        columns = cursor.fetchall()
+
+        grouped: dict[tuple[str, str], list[str]] = {}
+        for schema_name, table_name, column_name, data_type, max_length, precision, scale, nullable, description in columns:
+            type_name = str(data_type)
+            lower_type = type_name.lower()
+            if lower_type in {"nvarchar", "nchar"}:
+                length = "max" if max_length == -1 else str(max_length // 2)
+                type_name += f"({length})"
+            elif lower_type in {"varchar", "char", "varbinary", "binary"}:
+                length = "max" if max_length == -1 else str(max_length)
+                type_name += f"({length})"
+            elif lower_type in {"decimal", "numeric"}:
+                type_name += f"({precision},{scale})"
+            elif lower_type in {"datetime2", "datetimeoffset", "time"}:
+                type_name += f"({scale})"
+            suffix = " NULL" if nullable else " NOT NULL"
+            if description:
+                suffix += f" -- {description}"
+            grouped.setdefault((str(schema_name), str(table_name)), []).append(
+                f"- {column_name}: {type_name}{suffix}"
+            )
+
+        lines = ["当前客户数据库实时结构（这是表和字段名称的最高事实源）："]
+        for _, schema_name, table_name, _ in matched:
+            lines.append(f"[{schema_name}].[{table_name}]")
+            lines.extend(grouped.get((str(schema_name), str(table_name)), []))
+        return "\n".join(lines)[:30000]
+    finally:
+        conn.close()
 
 
 def substitute_params(sql: str, params: dict) -> str:

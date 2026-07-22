@@ -1,4 +1,5 @@
 """SQLite 持久化层 — 会话、消息、存储过程、校验 SQL。"""
+import json
 import sqlite3
 import uuid
 from config import DB_PATH
@@ -47,6 +48,9 @@ def init_db() -> None:
             validated_hash TEXT,
             deployed_hash TEXT,
             deployed_at TIMESTAMP,
+            query_spec_json TEXT,
+            schema_fingerprint TEXT,
+            bundle_hash TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
@@ -72,6 +76,9 @@ def init_db() -> None:
             "validated_hash": "TEXT",
             "deployed_hash": "TEXT",
             "deployed_at": "TIMESTAMP",
+            "query_spec_json": "TEXT",
+            "schema_fingerprint": "TEXT",
+            "bundle_hash": "TEXT",
         },
         "verify_queries": {
             "validation_spec": "TEXT DEFAULT '{}'",
@@ -192,7 +199,8 @@ def get_sp(sp_id: str) -> dict | None:
 def update_sp(sp_id: str, **kwargs) -> None:
     allowed = {"name", "code", "status", "syntax_valid",
                "business_valid", "verify_result", "parameters", "deployed_at",
-               "operation_type", "validated_hash", "deployed_hash"}
+               "operation_type", "validated_hash", "deployed_hash",
+               "query_spec_json", "schema_fingerprint", "bundle_hash"}
     updates = {k: v for k, v in kwargs.items() if k in allowed}
     if not updates:
         return
@@ -305,20 +313,57 @@ def update_verify_query(query_id: str, **kwargs) -> None:
     conn.close()
 
 
-def save_sp_bundle(sp_id: str, code: str, parameters: str,
-                   operation_type: str, verify_queries: list[dict]) -> dict:
-    """原子保存 SP 与全部校验 SQL，并使旧校验结论失效。"""
-    import json
+def save_sp_bundle(
+    sp_id: str,
+    code: str,
+    parameters: str,
+    operation_type: str,
+    verify_queries: list[dict],
+    validation_result: dict | None = None,
+) -> dict:
+    """在一个事务中保存 SP、Oracle 和可选的已通过校验状态。"""
+    validation_result = validation_result or {}
+    validated = bool(
+        validation_result.get("syntax_ok")
+        and validation_result.get("business_ok")
+    )
+    validated_hash = validation_result.get("bundle_hash") if validated else None
+    status = validation_result.get("status", "verified") if validated else "draft"
+    verify_result = (
+        json.dumps(validation_result, ensure_ascii=False) if validated else None
+    )
+    details_by_id = {
+        item.get("query_id"): item
+        for item in validation_result.get("details", [])
+        if item.get("query_id")
+    }
+    details_by_name = {
+        item.get("query"): item
+        for item in validation_result.get("details", [])
+        if item.get("query")
+    }
 
     conn = _get_conn()
     try:
         cursor = conn.execute(
             """UPDATE stored_procedures
-               SET code = ?, parameters = ?, operation_type = ?, status = 'draft',
-                   syntax_valid = 0, business_valid = 0, verify_result = NULL,
-                   validated_hash = NULL, updated_at = CURRENT_TIMESTAMP
+               SET code = ?, parameters = ?, operation_type = ?, status = ?,
+                   syntax_valid = ?, business_valid = ?, verify_result = ?,
+                   validated_hash = ?, bundle_hash = ?,
+                   updated_at = CURRENT_TIMESTAMP
                WHERE id = ?""",
-            (code, parameters, operation_type, sp_id),
+            (
+                code,
+                parameters,
+                operation_type,
+                status,
+                1 if validated else 0,
+                1 if validated else 0,
+                verify_result,
+                validated_hash,
+                validated_hash,
+                sp_id,
+            ),
         )
         if cursor.rowcount == 0:
             raise ValueError("SP 不存在")
@@ -334,15 +379,28 @@ def save_sp_bundle(sp_id: str, code: str, parameters: str,
             validation_spec = item.get("validation_spec", "{}")
             if not isinstance(validation_spec, str):
                 validation_spec = json.dumps(validation_spec, ensure_ascii=False)
+            detail = (
+                details_by_id.get(query_id)
+                or details_by_name.get(item.get("name"))
+            )
+            query_status = "pass" if validated else "pending"
+            result_detail = (
+                json.dumps(detail, ensure_ascii=False, indent=2)
+                if detail is not None else None
+            )
             values = (
-                item.get("name", "未命名校验"), item.get("sql_code", ""),
-                item.get("compare_columns", ""), validation_spec,
+                item.get("name", "未命名校验"),
+                item.get("sql_code", ""),
+                item.get("compare_columns", ""),
+                validation_spec,
+                query_status,
+                result_detail,
             )
             if query_id in existing_ids:
                 conn.execute(
                     """UPDATE verify_queries
                        SET name = ?, sql_code = ?, compare_columns = ?,
-                           validation_spec = ?, status = 'pending', result_detail = NULL
+                           validation_spec = ?, status = ?, result_detail = ?
                        WHERE id = ? AND sp_id = ?""",
                     values + (query_id, sp_id),
                 )
@@ -351,8 +409,9 @@ def save_sp_bundle(sp_id: str, code: str, parameters: str,
                 query_id = str(uuid.uuid4())
                 conn.execute(
                     """INSERT INTO verify_queries
-                       (id, sp_id, name, sql_code, compare_columns, validation_spec)
-                       VALUES (?, ?, ?, ?, ?, ?)""",
+                       (id, sp_id, name, sql_code, compare_columns,
+                        validation_spec, status, result_detail)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                     (query_id, sp_id) + values,
                 )
                 kept_ids.add(query_id)
@@ -364,6 +423,99 @@ def save_sp_bundle(sp_id: str, code: str, parameters: str,
             "SELECT * FROM stored_procedures WHERE id = ?", (sp_id,)
         ).fetchone()
         return dict(row)
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+def _insert_candidate_bundle(conn: sqlite3.Connection, session_id: str, bundle) -> dict:
+    """在调用方事务中插入一个已验证候选包。"""
+    from app.services.validation import compute_bundle_hash
+
+    sp = bundle.sp_dict()
+    queries = bundle.query_dicts()
+    computed_hash = compute_bundle_hash(sp, queries)
+    if bundle.bundle_hash and bundle.bundle_hash != computed_hash:
+        raise ValueError(f"{sp['name']} 的 bundle_hash 与实际内容不一致")
+    bundle_hash = computed_hash
+    sp_id = str(uuid.uuid4())
+    conn.execute(
+        """INSERT INTO stored_procedures
+           (id, session_id, name, code, status, syntax_valid, business_valid,
+            parameters, operation_type, validated_hash, query_spec_json,
+            schema_fingerprint, bundle_hash)
+           VALUES (?, ?, ?, ?, 'persisted', 1, 1, ?, ?, ?, ?, ?, ?)""",
+        (
+            sp_id,
+            session_id,
+            sp["name"],
+            sp["code"],
+            sp["parameters"],
+            sp["operation_type"],
+            bundle_hash,
+            sp["query_spec_json"],
+            sp["schema_fingerprint"],
+            bundle_hash,
+        ),
+    )
+    for query in queries:
+        query_id = str(uuid.uuid4())
+        validation_spec = query.get("validation_spec", {})
+        if not isinstance(validation_spec, str):
+            validation_spec = json.dumps(validation_spec, ensure_ascii=False)
+        conn.execute(
+            """INSERT INTO verify_queries
+               (id, sp_id, name, sql_code, compare_columns, validation_spec,
+                status, result_detail)
+               VALUES (?, ?, ?, ?, ?, ?, 'pass', NULL)""",
+            (
+                query_id,
+                sp_id,
+                query.get("name", "未命名校验"),
+                query.get("sql_code", ""),
+                query.get("compare_columns", ""),
+                validation_spec,
+            ),
+        )
+    row = conn.execute(
+        "SELECT * FROM stored_procedures WHERE id = ?", (sp_id,)
+    ).fetchone()
+    return dict(row)
+
+
+def replace_session_sp_bundles_atomically(session_id: str, bundles: list) -> list[dict]:
+    """整批候选全部写入成功后替换旧产物；异常时完整回滚。"""
+    if not bundles:
+        raise ValueError("候选包不能为空")
+    invalid = [
+        bundle.procedure_spec.name
+        for bundle in bundles
+        if bundle.status != "validated"
+    ]
+    if invalid:
+        raise ValueError("存在未通过全部闸门的候选: " + ", ".join(invalid))
+
+    conn = _get_conn()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        inserted = [
+            _insert_candidate_bundle(conn, session_id, bundle)
+            for bundle in bundles
+        ]
+        new_ids = [item["id"] for item in inserted]
+        placeholders = ",".join("?" for _ in new_ids)
+        conn.execute(
+            f"""DELETE FROM stored_procedures
+                WHERE session_id = ? AND id NOT IN ({placeholders})""",
+            [session_id, *new_ids],
+        )
+        conn.execute(
+            "UPDATE sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (session_id,),
+        )
+        conn.commit()
+        return inserted
     except Exception:
         conn.rollback()
         raise

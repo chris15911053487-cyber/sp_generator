@@ -64,7 +64,15 @@
         if (!text) return '';
         if (typeof marked === 'undefined') return escapeHtml(text).replace(/\n/g, '<br>');
         try {
-            return marked.parse(text);
+            const holder = document.createElement('div');
+            holder.innerHTML = marked.parse(text);
+            holder.querySelectorAll('table').forEach(table => {
+                const wrapper = document.createElement('div');
+                wrapper.className = 'markdown-table-wrap';
+                table.parentNode.insertBefore(wrapper, table);
+                wrapper.appendChild(table);
+            });
+            return holder.innerHTML;
         } catch(e) {
             return escapeHtml(text).replace(/\n/g, '<br>');
         }
@@ -141,11 +149,11 @@
 
     function renderVerifyTable(spName, rows) {
         let html = '<div class="verify-sp-section"><div class="verify-sp-name">📦 ' + escapeHtml(spName) + '</div>';
-        html += '<table class="verify-table"><thead><tr><th>#</th><th>校验名称</th><th>校验方式</th><th>对比列</th></tr></thead><tbody>';
+        html += '<div class="markdown-table-wrap"><table class="verify-table"><thead><tr><th>#</th><th>校验名称</th><th>校验方式</th><th>对比列</th></tr></thead><tbody>';
         for (const r of rows) {
             html += '<tr><td>' + escapeHtml(r.num) + '</td><td>' + escapeHtml(r.name) + '</td><td>' + escapeHtml(r.desc) + '</td><td><code>' + escapeHtml(r.columns) + '</code></td></tr>';
         }
-        html += '</tbody></table></div>';
+        html += '</tbody></table></div></div>';
         return html;
     }
 
@@ -550,6 +558,11 @@
                         terminalEventReceived = true;
                     }
 
+                    if (terminalEventReceived &&
+                            (data.type === 'progress' || data.type === 'auto_fix_progress')) {
+                        continue;
+                    }
+
                     if (data.type !== 'token' && data.type !== 'update' && data.type !== 'done') {
                         cancelTokenRender();
                         lastEventType = data.type;
@@ -589,9 +602,16 @@
                         // 判断校验是否全部通过
                         const vResults = (data.data && data.data.verify_results) ? data.data.verify_results : [];
                         const allPassed = vResults.length > 0 && vResults.every(vr => vr.syntax_ok && vr.business_ok);
-                        if (allPassed) {
+                        const persisted = data.data && data.data.status === 'persisted';
+                        const needsReview = data.data && data.data.status === 'needs_review';
+                        if (persisted && allPassed) {
                             assistantDiv.innerHTML += renderQuickActions([
                                 {label: '🚀 一键部署', action: 'deploy', style: 'primary'},
+                                {label: '🔄 重新生成', text: '请重新生成存储过程', style: 'secondary'},
+                            ]);
+                        } else if (needsReview) {
+                            assistantDiv.innerHTML += renderQuickActions([
+                                {label: '🔎 人工复核后重新生成', text: '我已复核差异，请按以下修改重新生成：', style: 'primary'},
                                 {label: '🔄 重新生成', text: '请重新生成存储过程', style: 'secondary'},
                             ]);
                         } else {
@@ -600,16 +620,16 @@
                                 {label: '🔄 重新生成', text: '请重新生成存储过程', style: 'secondary'},
                             ]);
                         }
-                        // 同步更新右侧 SP 卡片
+                        // 只有持久化成功后才同步右侧当前有效 SP。
                         for (const vr of vResults) {
+                            if (!persisted || !vr.sp_id) continue;
                             lastVerifyResults[vr.sp_id] = vr;
                             refreshSpStatusInPlace(vr.sp_id, vr);
                             showSpVerifyResult(vr.sp_id, vr);
                         }
                     } else if (data.type === 'update') {
-                        // 仅 generate/verify 节点会改变 SP 数据，避免 clarify/plan
-                        // 阶段不必要的 DOM 重建导致 CodeMirror 被销毁
-                        if (data.node === 'generate' || data.node === 'verify') {
+                        // 候选生成和失败校验不会修改当前有效 SP。
+                        if (data.node === 'verify' && data.data && data.data.status === 'persisted') {
                             loadSpList();
                         }
                     } else if (data.type === 'done') {
@@ -619,6 +639,8 @@
                         }
                         loadSpList();
                     } else if (data.type === 'error') {
+                        assistantText = data.content;
+                        lastEventType = 'error';
                         assistantDiv.className = 'message error';
                         assistantDiv.innerHTML = renderMarkdown(data.content)
                             + renderQuickActions([
@@ -907,7 +929,7 @@
         let html = '';
         for (const sp of spData.procedures) {
             spCache[sp.id] = sp;
-            const statusLabel = {draft:'草稿', verified:'已校验', verify_failed:'校验失败', deployed:'已部署'}[sp.status] || sp.status;
+            const statusLabel = {draft:'草稿', verified:'已校验', persisted:'已校验并保存', verify_failed:'校验失败', deployed:'已部署'}[sp.status] || sp.status;
             const statusCls = sp.status || 'draft';
             const synIcon = sp.syntax_valid ? '✅' : (sp.syntax_valid === 0 ? '❌' : '⬜');
             const bizIcon = sp.business_valid ? '✅' : (sp.business_valid === 0 ? '❌' : '⬜');
@@ -1420,7 +1442,7 @@
             const allOk = result.syntax_ok && result.business_ok;
             const status = result.status || (allOk ? 'verified' : 'verify_failed');
             const labels = {
-                draft: '草稿', verified: '已校验',
+                draft: '草稿', verified: '已校验', persisted: '已校验并保存',
                 verify_failed: '校验失败', deployed: '已部署',
             };
             statusEl.textContent = labels[status] || status;

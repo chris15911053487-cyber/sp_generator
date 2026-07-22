@@ -3,8 +3,7 @@ import json
 import re
 from functools import lru_cache
 from threading import Lock
-from typing import TypedDict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import NotRequired, TypedDict
 from langgraph.types import interrupt
 try:
     from langgraph.config import get_stream_writer
@@ -15,13 +14,17 @@ from langchain_core.messages import HumanMessage, SystemMessage, AIMessage, Tool
 from langchain_core.runnables import RunnableConfig
 from app.agent.prompts import (
     SYSTEM_PROMPT, CLARIFY_PROMPT, DESIGN_PROMPT,
-    GENERATE_PROMPT, VERIFY_SQL_PROMPT, VERIFY_PROMPT,
-    DESIGN_FEEDBACK_PROMPT, FIX_SP_PROMPT, FIX_VERIFY_SQL_PROMPT,
-    ASSUMPTIONS_PROMPT,
+    DESIGN_FEEDBACK_PROMPT, ASSUMPTIONS_PROMPT, PROCEDURE_CANDIDATE_PROMPT,
+    ORACLE_CANDIDATE_PROMPT, REPAIR_PROCEDURE_CANDIDATE_PROMPT,
+    REPAIR_ORACLE_CANDIDATE_PROMPT,
 )
 from app.agent.tools import create_tools
-from app.db.sqlserver import check_syntax, execute_query, substitute_params
-from app.db.sqlite import save_sp, save_verify_query, get_messages
+from app.db.sqlite import get_messages
+from app.services.candidate_pipeline import CandidateBundle, GateResult, VerifyQueryCandidate
+from app.services.generation_harness import (
+    GateError, QuerySpec, compile_query_spec,
+)
+from app.services.schema_evidence import capture_schema_evidence
 from config import get_llm_config
 
 
@@ -41,6 +44,8 @@ class AgentState(TypedDict):
     design_phase: str | None
     # 上一次 LLM 对用户反馈的回复，供 chat.py 展示
     last_feedback_reply: str
+    query_spec: NotRequired[dict]
+    candidate_bundles: NotRequired[list[dict]]
 
 
 _tools = create_tools()
@@ -277,6 +282,120 @@ def _classify_design_feedback(llm: ChatOpenAI, design: str, feedback: str) -> tu
     return "IRRELEVANT", "无法理解您的反馈，请确认方案或提出修改意见。", ""
 
 
+def _markdown_cell(value) -> str:
+    if value is None:
+        return "NULL"
+    return str(value).replace("|", "\\|").replace("\n", " ")
+
+
+def _code(value) -> str:
+    return chr(96) + _markdown_cell(value) + chr(96)
+
+
+def _column_refs(items) -> str:
+    if not items:
+        return "无"
+    return "、".join(
+        _code(f"{item.source_alias}.{item.column}") for item in items
+    )
+
+
+def _render_query_spec(query_spec: QuerySpec) -> str:
+    """把唯一业务契约确定性渲染为供用户确认的中文方案。"""
+    lines = ["## 1. 存储过程方案"]
+    operation_labels = {
+        "reporting": "查询",
+        "controlled_write": "受控写入",
+    }
+    for procedure in query_spec.procedures:
+        lines.extend([
+            "",
+            f"### {_code(procedure.name)}",
+            "",
+            f"- 用途：{procedure.purpose}",
+            f"- 操作类型：{operation_labels[procedure.operation_type]}",
+            "",
+            "#### 参数",
+            "",
+            "| 参数 | 类型 | 必填 | 默认值 | 含义 |",
+            "|---|---|---|---|---|",
+        ])
+        if procedure.parameters:
+            for item in procedure.parameters:
+                lines.append(
+                    f"| {_code(item.name)} | {_code(item.sql_type)} | "
+                    f"{'是' if item.required else '否'} | "
+                    f"{_markdown_cell(item.default)} | "
+                    f"{_markdown_cell(item.meaning)} |"
+                )
+        else:
+            lines.append("| 无 | — | — | — | — |")
+
+        lines.extend([
+            "",
+            "#### 数据来源",
+            "",
+            "| 表 | 别名 | 用途 |",
+            "|---|---|---|",
+        ])
+        for item in procedure.sources:
+            lines.append(
+                f"| {_code(f'{item.schema}.{item.table}')} | "
+                f"{_code(item.alias)} | {_markdown_cell(item.role)} |"
+            )
+
+        lines.extend(["", "#### 业务规则", ""])
+        if procedure.joins:
+            for item in procedure.joins:
+                lines.append(
+                    f"- {item.join_type.upper()} JOIN："
+                    f"{_code(f'{item.left.source_alias}.{item.left.column}')} = "
+                    f"{_code(f'{item.right.source_alias}.{item.right.column}')}；"
+                    f"{item.reason}"
+                )
+        for item in procedure.filters:
+            refs = _column_refs(item.column_refs)
+            params = "、".join(_code(name) for name in item.parameter_refs)
+            suffix = f"；参数：{params}" if params else ""
+            lines.append(f"- 过滤：{item.description}；字段：{refs}{suffix}")
+        lines.append(f"- 结果粒度：{_column_refs(procedure.grain)}")
+
+        lines.extend([
+            "",
+            "#### 输出",
+            "",
+            "| 输出列 | 类型 | 来源字段 | 聚合 | 含义 |",
+            "|---|---|---|---|---|",
+        ])
+        for item in procedure.outputs:
+            lines.append(
+                f"| {_code(item.name)} | {_code(item.sql_type)} | "
+                f"{_column_refs(item.source_columns)} | "
+                f"{_markdown_cell(item.aggregation or '无')} | "
+                f"{_markdown_cell(item.meaning)} |"
+            )
+
+        if procedure.writes:
+            lines.extend(["", "#### 写入范围", ""])
+            for item in procedure.writes:
+                lines.append(
+                    f"- {item.operation.upper()} "
+                    f"{_code(f'{item.schema}.{item.table}')}；"
+                    f"键：{', '.join(item.key_columns)}；"
+                    f"最多影响 {item.max_affected_rows} 行"
+                )
+
+        lines.extend(["", "#### 校验规则", ""])
+        for item in procedure.verification_rules:
+            columns = "、".join(_code(name) for name in item.required_columns)
+            lines.append(
+                f"- {item.name}（{item.mode}）：{item.description}；"
+                f"校验列：{columns or '无'}"
+            )
+
+    return "\n".join(lines)
+
+
 def clarify_node(state: AgentState, config: RunnableConfig | None = None) -> dict:
     """需求确认节点 — 系统控制编号，最多 5 个问题，可提前结束。"""
     llm = _get_llm()
@@ -451,11 +570,56 @@ def assumptions_node(state: AgentState, config: RunnableConfig | None = None) ->
 
 
 def design_node(state: AgentState, config: RunnableConfig | None = None) -> dict:
-    """方案设计节点 — 基于需求生成方案，支持多轮反馈确认。"""
+    """先固化方案及 QuerySpec，再让用户确认同一版本。"""
     llm = _get_llm()
     stream_writer = _get_writer(config)
     design_phase = state.get("design_phase")
     design = state.get("design", "")
+    raw_query_spec = state.get("query_spec")
+
+    if design_phase == "prepare_feedback" or not raw_query_spec or not design:
+        if not design:
+            confirmed_assumptions = state.get(
+                "confirmed_assumptions", "无特殊关键项",
+            )
+            prompt = DESIGN_PROMPT.format(
+                requirements=state["requirements"],
+                confirmed_assumptions=confirmed_assumptions,
+            )
+            messages = [
+                SystemMessage(content=SYSTEM_PROMPT),
+                HumanMessage(content=prompt),
+            ]
+            response = _invoke_with_tools(
+                llm, messages, max_rounds=3, stream_writer=stream_writer,
+            )
+            design = response.content
+
+        _write_progress(
+            stream_writer, "query_spec", "正在固化并校验方案业务契约...",
+        )
+        try:
+            query_spec = _compile_design_query_spec(llm, design)
+        except Exception as exc:
+            return {
+                "design": design,
+                "query_spec": {},
+                "mode": "design",
+                "status": "design_failed",
+                "error": f"方案无法形成有效业务契约：{exc}",
+            }
+        design = _render_query_spec(query_spec)
+        return {
+            "design": design,
+            "query_spec": query_spec.model_dump(mode="json", by_alias=True),
+            "mode": "design",
+            "status": "designed",
+            "design_phase": (
+                "feedback" if design_phase == "prepare_feedback" else "new"
+            ),
+            "last_feedback_reply": state.get("last_feedback_reply", ""),
+            "error": "",
+        }
 
     if design_phase == "feedback":
         # === 第二阶段：展示修改后方案，再次等待确认 ===
@@ -468,6 +632,7 @@ def design_node(state: AgentState, config: RunnableConfig | None = None) -> dict
         if isinstance(decision, dict) and decision.get("action") == "confirm":
             return {
                 "design": design,
+                "query_spec": raw_query_spec,
                 "mode": "generate",
                 "status": "designed",
                 "design_phase": None,
@@ -476,19 +641,20 @@ def design_node(state: AgentState, config: RunnableConfig | None = None) -> dict
 
 
         if isinstance(decision, dict) and decision.get("action") == "modify":
-            design = decision.get("design", design)
             return {
-                "design": design,
-                "mode": "generate",
+                "design": decision.get("design", design),
+                "query_spec": {},
+                "mode": "design",
                 "status": "designed",
-                "design_phase": None,
-                "last_feedback_reply": "",
+                "design_phase": "prepare_feedback",
+                "last_feedback_reply": "方案已按您的意见修改。",
             }
 
         if isinstance(decision, str) and decision.strip():
             if _is_explicit_design_confirmation(decision):
                 return {
                     "design": design,
+                    "query_spec": raw_query_spec,
                     "mode": "generate",
                     "status": "designed",
                     "design_phase": None,
@@ -498,6 +664,7 @@ def design_node(state: AgentState, config: RunnableConfig | None = None) -> dict
             if intent == "CONFIRM":
                 return {
                     "design": design,
+                    "query_spec": raw_query_spec,
                     "mode": "generate",
                     "status": "designed",
                     "design_phase": None,
@@ -506,10 +673,11 @@ def design_node(state: AgentState, config: RunnableConfig | None = None) -> dict
             elif intent == "MODIFY" and new_design:
                 return {
                     "design": new_design,
+                    "query_spec": {},
                     "mode": "design",
                     "status": "designed",
-                    "design_phase": "feedback",
-                    "last_feedback_reply": reply2 or "方案已按您的意见修改，请确认。",
+                    "design_phase": "prepare_feedback",
+                    "last_feedback_reply": reply2 or "方案已按您的意见修改。",
                 }
             else:
                 # IRRELEVANT
@@ -526,28 +694,19 @@ def design_node(state: AgentState, config: RunnableConfig | None = None) -> dict
         # 空响应视为确认
         return {
             "design": design,
+            "query_spec": raw_query_spec,
             "mode": "generate",
             "status": "designed",
             "design_phase": None,
             "last_feedback_reply": "",
         }
 
-    # === 第一阶段：初次生成方案（如已有方案则复用，避免 IRRELEVANT 循环时重新生成） ===
-    design = state.get("design", "")
-    if not design:
-        confirmed_assumptions = state.get("confirmed_assumptions", "无特殊关键项")
-        prompt = DESIGN_PROMPT.format(
-            requirements=state["requirements"],
-            confirmed_assumptions=confirmed_assumptions,
-        )
-        messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=prompt)]
-        response = _invoke_with_tools(llm, messages, max_rounds=3, stream_writer=stream_writer)
-        design = response.content
-
+    # 展示并确认已经固化的初始方案。
     decision = interrupt({"type": "design", "content": design, "phase": "new"})
     if isinstance(decision, dict) and decision.get("action") == "confirm":
         return {
             "design": design,
+            "query_spec": raw_query_spec,
             "mode": "generate",
             "status": "designed",
             "design_phase": None,
@@ -559,10 +718,11 @@ def design_node(state: AgentState, config: RunnableConfig | None = None) -> dict
     if isinstance(decision, dict) and decision.get("action") == "modify":
         return {
             "design": decision.get("design", design),
-            "mode": "generate",
+            "query_spec": {},
+            "mode": "design",
             "status": "designed",
-            "design_phase": None,
-            "last_feedback_reply": "",
+            "design_phase": "prepare_feedback",
+            "last_feedback_reply": "方案已按您的意见修改。",
         }
 
     # 文本反馈分类
@@ -570,6 +730,7 @@ def design_node(state: AgentState, config: RunnableConfig | None = None) -> dict
         if _is_explicit_design_confirmation(decision):
             return {
                 "design": design,
+                "query_spec": raw_query_spec,
                 "mode": "generate",
                 "status": "designed",
                 "design_phase": None,
@@ -579,6 +740,7 @@ def design_node(state: AgentState, config: RunnableConfig | None = None) -> dict
         if intent == "CONFIRM":
             return {
                 "design": design,
+                "query_spec": raw_query_spec,
                 "mode": "generate",
                 "status": "designed",
                 "design_phase": None,
@@ -587,10 +749,11 @@ def design_node(state: AgentState, config: RunnableConfig | None = None) -> dict
         elif intent == "MODIFY" and new_design:
             return {
                 "design": new_design,
+                "query_spec": {},
                 "mode": "design",
                 "status": "designed",
-                "design_phase": "feedback",
-                "last_feedback_reply": reply or "方案已按您的意见修改，请确认。",
+                "design_phase": "prepare_feedback",
+                "last_feedback_reply": reply or "方案已按您的意见修改。",
             }
         else:
             # IRRELEVANT
@@ -607,6 +770,7 @@ def design_node(state: AgentState, config: RunnableConfig | None = None) -> dict
     # 默认：空响应视为确认
     return {
         "design": design,
+        "query_spec": raw_query_spec,
         "mode": "generate",
         "status": "designed",
         "design_phase": None,
@@ -638,380 +802,387 @@ def _parse_json(content: str) -> dict | None:
     return None
 
 
-def _parse_sp_params(code: str) -> list[dict]:
-    """从 SP 代码中解析 @参数 声明，返回 [{name, type}, ...]"""
-    params = []
-    pattern = r'@(\w+)\s+(\w+(?:\((?:MAX|\d+(?:,\d+)?)\))?)'
-    for m in re.finditer(pattern, code, re.IGNORECASE):
-        name = m.group(1)
-        if name.upper() in ('NOCOUNT', 'RETURNS', 'MESSAGE', 'ERROR'):
-            continue
-        params.append({"name": name, "type": m.group(2).upper(), "default": ""})
-    return params
+def _normalize_compare_columns(value) -> str:
+    """将 LLM 返回的对比列规范化为逗号分隔文本。"""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        if not all(isinstance(column, str) for column in value):
+            raise ValueError("compare_columns 列表只能包含字符串")
+        return ",".join(column.strip() for column in value if column.strip())
+    raise ValueError("compare_columns 必须是字符串或字符串列表")
 
 
-def _extract_sp_output_projection(code: str) -> str:
-    """提取首个结果集的 SELECT 投影，不向 Oracle 生成阶段暴露 FROM/WHERE 实现。"""
-    match = re.search(r"\bSELECT\b([\s\S]*?)\bFROM\b", code, re.IGNORECASE)
-    if not match:
-        return "未能静态提取；必须依据已确认方案中的输出契约"
-    projection = "SELECT" + match.group(1)
-    return projection.strip()[:4000]
+def _clean_procedure_code(code: str) -> str:
+    code = code.strip()
+    code = re.sub(r'\n\s*GO\s*\n', '\n', code, flags=re.IGNORECASE)
+    return re.sub(r'\n\s*GO\s*$', '', code, flags=re.IGNORECASE)
 
 
-def _parse_sql_placeholders(sql_code: str) -> set[str]:
-    """从校验 SQL 中解析 {参数名} 占位符"""
-    return set(re.findall(r'\{(\w+)\}', sql_code))
+def _candidate_json(llm: ChatOpenAI, prompt: str, label: str) -> dict:
+    response = llm.invoke([
+        SystemMessage(content=SYSTEM_PROMPT),
+        HumanMessage(content=prompt),
+    ])
+    data = _parse_json(response.content)
+    if not isinstance(data, dict):
+        raise ValueError(f"{label} 未返回有效 JSON 对象")
+    return data
 
 
-def _merge_parameters(sp_params: list[dict], sql_placeholders: set[str],
-                      llm_params: list[dict]) -> list[dict]:
-    """合并 SP 参数 + 校验 SQL 占位符 + LLM 默认值，取并集"""
-    param_map: dict[str, dict] = {}
-    # 1. SP 声明提供类型信息
-    for p in sp_params:
-        param_map[p["name"]] = {"name": p["name"], "type": p["type"], "default": p.get("default", "")}
-    # 2. SQL 占位符补充（无类型信息时默认 VARCHAR）
-    for name in sql_placeholders:
-        if name not in param_map:
-            param_map[name] = {"name": name, "type": "VARCHAR", "default": ""}
-    # 3. LLM 参数覆盖默认值
-    for p in llm_params:
-        name = p.get("name", "")
-        if not name:
-            continue
-        if name in param_map:
-            if p.get("type"):
-                param_map[name]["type"] = str(p["type"]).upper()
-            if p.get("default") is not None and str(p.get("default")) != "":
-                param_map[name]["default"] = str(p["default"])
-        else:
-            param_map[name] = {
-                "name": name,
-                "type": str(p.get("type", "VARCHAR")).upper(),
-                "default": str(p.get("default", "")),
-            }
-    return list(param_map.values())
+def _compile_design_query_spec(llm: ChatOpenAI, design: str) -> QuerySpec:
+    return compile_query_spec(
+        design,
+        lambda prompt: llm.invoke([
+            SystemMessage(content=SYSTEM_PROMPT),
+            HumanMessage(content=prompt),
+        ]),
+    )
 
 
-def _extract_verify_logic(design: str) -> dict[str, list[dict]]:
-    """从设计方案文本中提取结构化的校验逻辑。
+def _procedure_schema_json(query_spec: QuerySpec, procedure_spec,
+                           schema_evidence) -> str:
+    qualified = {
+        (item.schema, item.table) for item in procedure_spec.sources
+    } | {
+        (item.schema, item.table) for item in procedure_spec.writes
+    }
+    payload = {
+        "database_name": schema_evidence.database_name,
+        "captured_at": schema_evidence.captured_at.isoformat(),
+        "fingerprint": schema_evidence.fingerprint,
+        "objects": [
+            item.model_dump(mode="json", by_alias=True)
+            for item in schema_evidence.objects
+            if (item.schema, item.name) in qualified
+        ],
+        "unresolved": [
+            item.model_dump(mode="json")
+            for item in schema_evidence.unresolved
+            if any(
+                item.identifier.startswith(f"{schema}.{table}")
+                for schema, table in qualified
+            )
+        ],
+    }
+    return json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
 
-    返回 {sp_name: [{"name": ..., "description": ..., "compare_columns": ...}, ...]}
-    兼容两种格式：
-    1. 严格格式：<!-- VERIFY_LOGIC_START --> ... <!-- VERIFY_LOGIC_END -->
-    2. 宽松格式：以"校验逻辑"为标题，后跟 SP名称 + 校验N 的内容块
-    """
-    result = {}
-    # 优先尝试严格格式
-    m = re.search(r'<!--\s*VERIFY_LOGIC_START\s*-->(.*?)<!--\s*VERIFY_LOGIC_END\s*-->', design, re.DOTALL)
-    if m:
-        block = m.group(1).strip()
+
+def _generate_procedure_candidate(llm: ChatOpenAI, query_spec: QuerySpec,
+                                  procedure_spec, schema_evidence) -> str:
+    schema_json = _procedure_schema_json(
+        query_spec, procedure_spec, schema_evidence,
+    )
+    data = _candidate_json(
+        llm,
+        PROCEDURE_CANDIDATE_PROMPT.format(
+            query_spec=query_spec.canonical_json(),
+            procedure_spec=json.dumps(
+                procedure_spec.model_dump(mode="json", by_alias=True),
+                ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ),
+            schema_fingerprint=schema_evidence.fingerprint,
+            schema_evidence=schema_json,
+        ),
+        procedure_spec.name,
+    )
+    code = data.get("code")
+    if not isinstance(code, str) or not code.strip():
+        raise ValueError(f"{procedure_spec.name} 缺少完整存储过程 SQL")
+    return _clean_procedure_code(code)
+
+
+def _generate_oracle_candidates(llm: ChatOpenAI, query_spec: QuerySpec,
+                                procedure_spec, schema_evidence
+                                ) -> list[VerifyQueryCandidate]:
+    schema_json = _procedure_schema_json(
+        query_spec, procedure_spec, schema_evidence,
+    )
+    data = _candidate_json(
+        llm,
+        ORACLE_CANDIDATE_PROMPT.format(
+            query_spec=query_spec.canonical_json(),
+            procedure_spec=json.dumps(
+                procedure_spec.model_dump(mode="json", by_alias=True),
+                ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            ),
+            schema_fingerprint=schema_evidence.fingerprint,
+            schema_evidence=schema_json,
+        ),
+        f"{procedure_spec.name} Oracle",
+    )
+    raw_queries = data.get("verify_queries")
+    if not isinstance(raw_queries, list) or not raw_queries:
+        raise ValueError(f"{procedure_spec.name} 未生成独立 Oracle 校验规则")
+    normalized = []
+    for item in raw_queries:
+        if not isinstance(item, dict):
+            raise ValueError(f"{procedure_spec.name} Oracle 规则必须是对象")
+        candidate = dict(item)
+        candidate["compare_columns"] = _normalize_compare_columns(
+            candidate.get("compare_columns", ""),
+        )
+        normalized.append(VerifyQueryCandidate.model_validate(candidate))
+    return normalized
+
+
+def _repair_candidate(llm: ChatOpenAI, bundle: CandidateBundle,
+                      errors: list) -> CandidateBundle:
+    repaired = bundle.model_copy(deep=True)
+    serialized_errors = json.dumps(
+        [item.model_dump(mode="json") for item in errors],
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
+    schema_json = _procedure_schema_json(
+        bundle.query_spec, bundle.procedure_spec, bundle.schema_evidence,
+    )
+    artifacts = {item.artifact for item in errors}
+    if "procedure" in artifacts:
+        data = _candidate_json(
+            llm,
+            REPAIR_PROCEDURE_CANDIDATE_PROMPT.format(
+                procedure_spec=json.dumps(
+                    bundle.procedure_spec.model_dump(mode="json", by_alias=True),
+                    ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                ),
+                schema_fingerprint=bundle.schema_evidence.fingerprint,
+                schema_evidence=schema_json,
+                errors=serialized_errors,
+                sql=bundle.procedure_sql,
+            ),
+            f"{bundle.procedure_spec.name} 修复",
+        )
+        fixed_sql = data.get("fixed_sql")
+        if not isinstance(fixed_sql, str) or not fixed_sql.strip():
+            raise ValueError("SP 修复模型未返回 fixed_sql")
+        repaired.procedure_sql = _clean_procedure_code(fixed_sql)
+
+    if "oracle" in artifacts:
+        data = _candidate_json(
+            llm,
+            REPAIR_ORACLE_CANDIDATE_PROMPT.format(
+                procedure_spec=json.dumps(
+                    bundle.procedure_spec.model_dump(mode="json", by_alias=True),
+                    ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                ),
+                schema_fingerprint=bundle.schema_evidence.fingerprint,
+                schema_evidence=schema_json,
+                errors=serialized_errors,
+                verify_queries=json.dumps(
+                    [item.model_dump(mode="json") for item in bundle.verify_queries],
+                    ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                ),
+            ),
+            f"{bundle.procedure_spec.name} Oracle 修复",
+        )
+        raw_queries = data.get("verify_queries")
+        if not isinstance(raw_queries, list) or not raw_queries:
+            raise ValueError("Oracle 修复模型未返回 verify_queries")
+        repaired.verify_queries = [
+            VerifyQueryCandidate.model_validate(item) for item in raw_queries
+        ]
+    return repaired
+
+
+def _candidate_result(bundle: CandidateBundle) -> dict:
+    business_gate = next(
+        (item for item in bundle.gate_results if item.gate == "business"),
+        None,
+    )
+    business = business_gate.details.get("result") if business_gate else None
+    if isinstance(business, dict):
+        result = dict(business)
+        result.setdefault("sp_id", None)
+        result.setdefault("sp_name", bundle.procedure_spec.name)
     else:
-        # 宽松匹配：查找"校验逻辑"标题后的内容块（兼容编号标题如 "## 2. 校验逻辑描述"）
-        m2 = re.search(r'(?:^|\n)[#*\s\d.]*校验逻辑(?:描述)?[^\n]*\n([\s\S]*?)(?=\n##\s|\Z)', design)
-        if not m2:
-            return result
-        block = m2.group(1).strip()
-
-    current_sp = None
-
-    for line in block.split('\n'):
-        line = line.strip()
-        if not line:
-            continue
-
-        # 匹配 SP 名称行: 兼容 "- SP名称: sp_XXX" 和 "SP名称: sp_XXX"
-        sp_match = re.match(r'^(?:-\s*)?SP名称[:：]\s*(.+)$', line, re.IGNORECASE)
-        if sp_match:
-            current_sp = sp_match.group(1).strip()
-            result[current_sp] = []
-            continue
-
-        # 匹配校验项行: 兼容 "- 校验N: ..." 和 "校验N: ..."
-        vq_match = re.match(r'^(?:-\s*)?校验\d+[:：]\s*(.+)$', line)
-        if vq_match and current_sp:
-            parts = [p.strip() for p in vq_match.group(1).split('|')]
-            if len(parts) >= 2:
-                entry = {
-                    "name": parts[0],
-                    "description": parts[1],
-                    "compare_columns": parts[2] if len(parts) >= 3 else "",
-                }
-                result[current_sp].append(entry)
-
+        details = []
+        for gate in bundle.gate_results:
+            for error in gate.errors:
+                details.append({
+                    "type": error.category,
+                    "pass": False,
+                    "error": error.message,
+                    "code": error.code,
+                    "artifact": error.artifact,
+                })
+        passed_before_business = all(
+            gate.passed for gate in bundle.gate_results
+            if gate.gate != "business"
+        )
+        result = {
+            "sp_id": None,
+            "sp_name": bundle.procedure_spec.name,
+            "syntax_ok": passed_before_business,
+            "business_ok": False,
+            "operation_type": bundle.sp_dict()["operation_type"],
+            "bundle_hash": bundle.bundle_hash,
+            "details": details,
+        }
+    result["candidate_status"] = bundle.status
+    result["repair_count"] = bundle.repair_count
+    result["bundle_hash"] = bundle.bundle_hash or result.get("bundle_hash", "")
     return result
 
 
-def _get_verify_logic_for_sp(verify_logic: dict[str, list[dict]], sp_name: str) -> str:
-    """获取指定SP的校验逻辑描述文本，用于传给VERIFY_SQL_PROMPT。"""
-    # 精确匹配
-    items = verify_logic.get(sp_name, [])
-    if not items:
-        # 模糊匹配（SP名称可能有前缀差异）
-        for key, val in verify_logic.items():
-            if key.lower() in sp_name.lower() or sp_name.lower() in key.lower():
-                items = val
-                break
-    if not items:
-        return ""
-
-    lines = []
-    for i, item in enumerate(items, 1):
-        lines.append(f"校验{i}: {item['name']} — {item['description']}（对比列: {item['compare_columns']}）")
-    return "\n".join(lines)
-
-
-def _generate_verify_sql_for_sp(llm: ChatOpenAI, sp_row: dict, design: str, verify_logic_text: str = "") -> dict:
-    """为单个 SP 生成校验 SQL（可并行调用）。返回更新后的 sp_row。"""
-    sp_params = _parse_sp_params(sp_row.get("code", ""))
-    verify_queries: list = []
-    sql_placeholders: set[str] = set()
-    llm_params: list = []
-
-    vq_prompt = VERIFY_SQL_PROMPT.format(
-        sp_name=sp_row["name"],
-        sp_output_projection=_extract_sp_output_projection(sp_row.get("code", "")),
-        design=design,
-        verify_logic=verify_logic_text or "未提取到结构化校验逻辑；仅依据已确认设计生成，禁止参考 SP 实现。",
-    )
-    vq_messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=vq_prompt)]
-    # 校验 SQL 严格派生自已确认的设计，不向该调用提供 SP 主体。
-    vq_response = llm.invoke(vq_messages)
-    vq_data = _parse_json(vq_response.content)
-
-    if vq_data:
-        raw_queries = vq_data.get("verify_queries", [])
-        if isinstance(raw_queries, list):
-            verify_queries = raw_queries
-        for vq in verify_queries:
-            if not isinstance(vq, dict):
-                continue
-            save_verify_query(
-                sp_row["id"],
-                vq.get("name", "未命名校验"),
-                vq.get("sql_code", ""),
-                vq.get("compare_columns", ""),
-                json.dumps(vq.get("validation_spec", {}), ensure_ascii=False),
-            )
-            sql_placeholders |= _parse_sql_placeholders(vq.get("sql_code", ""))
-        llm_params = vq_data.get("parameters", [])
-
-    # 合并参数并集
-    print(f"[DEBUG params] SP={sp_row['name']}", flush=True)
-    print(f"[DEBUG params]   sp_params from code: {sp_params}", flush=True)
-    print(f"[DEBUG params]   sql_placeholders: {sql_placeholders}", flush=True)
-    print(f"[DEBUG params]   llm_params: {llm_params}", flush=True)
-    merged = _merge_parameters(sp_params, sql_placeholders, llm_params)
-    print(f"[DEBUG params]   merged={merged}", flush=True)
-    if merged:
-        from app.db.sqlite import update_sp as db_update_sp2
-        db_update_sp2(sp_row["id"], parameters=json.dumps(merged, ensure_ascii=False))
-        sp_row["parameters"] = json.dumps(merged, ensure_ascii=False)
-
-    return sp_row
-
-
 def generate_node(state: AgentState, config: RunnableConfig | None = None) -> dict:
-    """代码生成节点 — 两阶段：先生成 SP，再为每个 SP 单独生成校验 SQL。"""
-    from app.db.sqlite import (
-        delete_sp, delete_sps_except, get_verify_queries,
-    )
-
+    """使用已确认的 QuerySpec 生成纯内存候选；不得再次解释设计。"""
     llm = _get_llm()
-    stream_writer = _get_writer(config)
-    _write_progress(stream_writer, "generate", "正在生成存储过程代码...")
-    session_id = state["session_id"]
-    design = state["design"]
-
-    # === 阶段 1：生成存储过程代码 ===
-    prompt = GENERATE_PROMPT.format(design=design)
-    messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=prompt)]
-    # 表结构不确定性应在设计阶段解决；生成阶段保持单次结构化调用，避免模型
-    # 陷入工具循环（旧实现最坏会产生 8 次工具轮次 + 1 次收尾调用）。
-    response = llm.invoke(messages)
-    data = _parse_json(response.content)
-    print(f"[DEBUG generate_node] parsed={'OK' if data else 'FAIL'}, procedures={len(data.get('procedures',[])) if data else 0}", flush=True)
-
-    if data is None:
-        # FAIL 时不删除旧 SP：避免删了旧的又没存新的，导致 DB 变空、
-        # 而 state.sp_list 仍残留旧值，造成"校验全对但右侧全空"的不一致
-        return {
-            "error": f"无法解析 LLM 响应为 JSON: {response.content[:500]}",
-            "raw_response": response.content,
-        }
-
-    procedures = data.get("procedures", [])
-    if not isinstance(procedures, list) or not procedures:
-        return {"error": "LLM 未生成任何存储过程，已保留原有制品"}
-
-    # parsed OK：先保存新 SP，再删除旧 SP（级联删除校验 SQL）。
-    # 这样代码重新生成期间右侧列表始终有旧 SP，新 SP 全部就绪后才替换。
-    sp_list = []
+    writer = _get_writer(config)
     try:
-        for proc in procedures:
-            # 清理代码：移除 GO 语句（SSMS 批处理分隔符，不是有效 T-SQL）
-            code = proc["code"].strip()
-            code = re.sub(r'\n\s*GO\s*\n', '\n', code, flags=re.IGNORECASE)
-            code = re.sub(r'\n\s*GO\s*$', '', code, flags=re.IGNORECASE)
-            sp = save_sp(
-                session_id, proc["name"], code,
-                operation_type=proc.get("operation_type", "query"),
+        raw_query_spec = state.get("query_spec")
+        if not raw_query_spec:
+            raise ValueError("已确认方案缺少 QuerySpec，请返回方案阶段重新确认")
+        query_spec = QuerySpec.model_validate(raw_query_spec)
+        _write_progress(writer, "schema", "正在绑定目标数据库实时 Schema...")
+        schema_evidence = capture_schema_evidence(query_spec)
+        if schema_evidence.unresolved:
+            unresolved = "；".join(
+                f"{item.identifier}: {item.reason}"
+                for item in schema_evidence.unresolved
             )
-            sp_row = dict(sp) if not isinstance(sp, dict) else sp
-            sp_list.append(sp_row)
-    except Exception as exc:
-        for item in sp_list:
-            delete_sp(item["id"])
-        return {"error": f"保存新存储过程失败，已保留原有制品: {exc}"}
-    _write_progress(
-        stream_writer, "verify_sql",
-        f"已生成 {len(sp_list)} 个存储过程，正在并行设计校验 SQL...",
-    )
-    # === 阶段 2：并行生成校验 SQL ===
-    # 注意：旧 SP 暂不删除，等阶段 2 全部完成后统一替换，
-    # 避免校验 SQL 生成中途出错导致旧 SP 已丢、新 SP 不完整
+            raise ValueError(f"Schema 精确绑定失败：{unresolved}")
 
-    # 从设计方案中提取结构化校验逻辑
-    verify_logic_map = _extract_verify_logic(design)
-
-    MAX_PARALLEL = 3  # 最大并行数，避免 LLM API 限流
-    failures = []
-    with ThreadPoolExecutor(max_workers=MAX_PARALLEL) as executor:
-        futures = {
-            executor.submit(
-                _generate_verify_sql_for_sp, llm, sp_row, design,
-                _get_verify_logic_for_sp(verify_logic_map, sp_row["name"])
-            ): sp_row
-            for sp_row in sp_list
-        }
-        completed = 0
-        for future in as_completed(futures):
-            sp_row = futures[future]
-            try:
-                future.result()
-            except Exception as e:
-                print(f"[ERROR] 校验 SQL 生成失败: {sp_row.get('name')}: {e}", flush=True)
-                failures.append(f"{sp_row.get('name')}: {e}")
-            completed += 1
+        bundles = []
+        for index, procedure_spec in enumerate(query_spec.procedures, start=1):
             _write_progress(
-                stream_writer, "verify_sql", f"校验 SQL 进度：{completed}/{len(futures)}",
+                writer,
+                "candidate",
+                f"正在生成候选 {index}/{len(query_spec.procedures)}：{procedure_spec.name}",
             )
-
-    for sp_row in sp_list:
-        queries = get_verify_queries(sp_row["id"])
-        required_modes = set()
-        for query in queries:
-            try:
-                spec = json.loads(query.get("validation_spec") or "{}")
-            except (TypeError, json.JSONDecodeError):
-                spec = {}
-            if spec.get("required", True):
-                required_modes.add(spec.get("mode"))
-        expected_modes = (
-            {"scalar", "aggregate", "keyed_rows"}
-            if sp_row.get("operation_type", "query") == "query"
-            else {"change_set"}
-        )
-        if not required_modes.intersection(expected_modes):
-            failures.append(f"{sp_row['name']}: 缺少必选直接对账规则")
-
-    if failures:
-        for item in sp_list:
-            delete_sp(item["id"])
+            procedure_sql = _generate_procedure_candidate(
+                llm, query_spec, procedure_spec, schema_evidence,
+            )
+            verify_queries = _generate_oracle_candidates(
+                llm, query_spec, procedure_spec, schema_evidence,
+            )
+            bundles.append(CandidateBundle(
+                query_spec=query_spec,
+                procedure_spec=procedure_spec,
+                procedure_sql=procedure_sql,
+                verify_queries=verify_queries,
+                schema_evidence=schema_evidence,
+            ))
+    except Exception as exc:
         return {
-            "error": "校验 SQL 生成未完成，已保留原有制品: " + "；".join(failures),
+            "status": "generate_failed",
+            "error": str(exc),
         }
-
-    # 新 SP 全部就绪（代码 + 参数 + 校验 SQL），现在替换旧 SP
-    delete_sps_except(session_id, [s["id"] for s in sp_list])
 
     return {
-        "sp_list": sp_list,
+        "query_spec": query_spec.model_dump(mode="json", by_alias=True),
+        "candidate_bundles": [
+            item.model_dump(mode="json", by_alias=True) for item in bundles
+        ],
+        "sp_list": [
+            {"name": item.procedure_spec.name, "status": "candidate_generated"}
+            for item in bundles
+        ],
         "mode": "verify",
-        "status": "generated",
+        "status": "candidate_generated",
+        "error": "",
     }
 
 
 def verify_node(state: AgentState, config: RunnableConfig | None = None) -> dict:
-    """统一校验节点：临时执行 SP，不部署、不自动修改代码。"""
-    from app.db.sqlite import (
-        get_sps, get_verify_queries, update_sp as db_update_sp, update_verify_query,
-    )
-    from app.services.validation import validate_sp_bundle
+    """校验整批内存候选；全部通过后在一个 SQLite 事务中替换。"""
+    from app.db.sqlite import replace_session_sp_bundles_atomically
+    from app.services.candidate_pipeline import validate_candidate_with_repairs
 
-    stream_writer = _get_writer(config)
-    _write_progress(stream_writer, "verify", "正在执行语法、运行和业务数据校验...")
-    sp_list = state.get("sp_list", [])
-    if not sp_list and state.get("session_id"):
-        sp_list = get_sps(state["session_id"])
-
-    results = []
-    all_pass = bool(sp_list)
-    for original in sp_list:
-        current = next(
-            (item for item in get_sps(state.get("session_id", "")) if item["id"] == original["id"]),
-            original,
-        )
-        queries = get_verify_queries(current["id"])
-        params = {}
-        try:
-            definitions = json.loads(current.get("parameters") or "[]")
-            params = {
-                str(item.get("name", "")).lstrip("@"): item.get("default")
-                for item in definitions if item.get("default") not in (None, "")
-            }
-        except (TypeError, json.JSONDecodeError):
-            pass
-        result = validate_sp_bundle(current, queries, params)
-        if any(
-            detail.get("type") == "execution"
-            for detail in result.get("details", [])
-        ):
-            _write_progress(stream_writer, "verify", "校验执行异常，正在重试（1/1）...")
-            result = validate_sp_bundle(current, queries, params)
-        passed = result["syntax_ok"] and result["business_ok"]
-        status = "verify_failed"
-        if passed:
-            status = (
-                "deployed"
-                if current.get("deployed_hash") == result["bundle_hash"]
-                else "verified"
-            )
-        result["status"] = status
-        db_update_sp(
-            current["id"],
-            syntax_valid=1 if result["syntax_ok"] else 0,
-            business_valid=1 if result["business_ok"] else 0,
-            status=status,
-            verify_result=json.dumps(result, ensure_ascii=False),
-            validated_hash=result["bundle_hash"] if passed else None,
-        )
-        detail_by_id = {
-            detail.get("query_id"): detail
-            for detail in result.get("details", []) if detail.get("query_id")
+    writer = _get_writer(config)
+    raw_bundles = state.get("candidate_bundles") or []
+    if not raw_bundles:
+        return {
+            "status": "verify_failed",
+            "verify_results": [],
+            "error": "没有可校验的内存候选，旧制品保持不变",
         }
-        global_failure = next(
-            (
-                detail for detail in result.get("details", [])
-                if not detail.get("pass", False) and not detail.get("query_id")
-            ),
-            None,
-        )
-        for query in queries:
-            query_id = query.get("id")
-            detail = detail_by_id.get(query_id) or global_failure
-            if not query_id or detail is None:
-                continue
-            update_verify_query(
-                query_id,
-                status="pass" if detail.get("pass") else "fail",
-                result_detail=json.dumps(detail, ensure_ascii=False, indent=2),
-            )
-        results.append(result)
-        all_pass = all_pass and passed
 
+    llm = _get_llm()
+    bundles = [
+        CandidateBundle.model_validate_json(json.dumps(item, ensure_ascii=False))
+        for item in raw_bundles
+    ]
+    validated = []
+    for index, bundle in enumerate(bundles, start=1):
+        _write_progress(
+            writer,
+            "verify",
+            f"正在执行候选闸门 {index}/{len(bundles)}：{bundle.procedure_spec.name}",
+        )
+        try:
+            checked = validate_candidate_with_repairs(
+                bundle,
+                lambda candidate, errors: _repair_candidate(
+                    llm, candidate, errors,
+                ),
+                schema_refresher=capture_schema_evidence,
+            )
+        except Exception as exc:
+            bundle.status = "failed"
+            bundle.gate_results.append(GateResult(
+                gate="business",
+                passed=False,
+                errors=[GateError(
+                    artifact="bundle",
+                    category="business",
+                    code="harness_exception",
+                    message=str(exc),
+                    schema_subset=None,
+                    repairable=False,
+                )],
+            ))
+            validated.append(bundle)
+            continue
+        validated.append(checked)
+
+    results = [_candidate_result(item) for item in validated]
+    if any(item.status == "needs_review" for item in validated):
+        return {
+            "status": "needs_review",
+            "candidate_bundles": [
+                item.model_dump(mode="json", by_alias=True) for item in validated
+            ],
+            "verify_results": results,
+            "error": "",
+        }
+    if any(item.status != "validated" for item in validated):
+        return {
+            "status": "verify_failed",
+            "candidate_bundles": [
+                item.model_dump(mode="json", by_alias=True) for item in validated
+            ],
+            "verify_results": results,
+            "error": "",
+        }
+
+    try:
+        inserted = replace_session_sp_bundles_atomically(
+            state["session_id"], validated,
+        )
+    except Exception as exc:
+        return {
+            "status": "verify_failed",
+            "candidate_bundles": [
+                item.model_dump(mode="json", by_alias=True) for item in validated
+            ],
+            "verify_results": results,
+            "error": f"候选已通过但原子保存失败，旧制品保持不变：{exc}",
+        }
+
+    ids_by_name = {item["name"]: item["id"] for item in inserted}
+    for result in results:
+        result["sp_id"] = ids_by_name.get(result["sp_name"])
+        result["status"] = "persisted"
     return {
-        "status": "verified" if all_pass else "verify_failed",
+        "status": "persisted",
+        "sp_list": inserted,
+        "candidate_bundles": [
+            item.model_dump(mode="json", by_alias=True) for item in validated
+        ],
         "verify_results": results,
+        "error": "",
     }

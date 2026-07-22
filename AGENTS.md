@@ -127,7 +127,7 @@ docker compose run --rm --no-deps \
   /workspace/test_verify_autofix.py
 ```
 
-上述单元测试命令已验证可用，当前结果为 `10 passed`。
+上述单元测试命令已验证可用，当前结果为 `12 passed`。
 
 ### 服务部署后的检查
 

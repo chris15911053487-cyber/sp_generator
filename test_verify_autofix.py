@@ -1,148 +1,82 @@
-"""显式校验复用统一服务；生成失败不得替换旧制品。"""
-from langchain_core.messages import AIMessage
-
-from app.agent import nodes
-from app.db import sqlite as sqlite_db
-from app.services import validation
+"""候选生成状态与 SQL Server 兼容入口测试。"""
+from app.db import sqlserver
 
 
-def test_verify_node_uses_unified_validation_without_deployment(monkeypatch):
-    sp = {
-        "id": "sp-1", "name": "sp_Test", "code": "CREATE PROCEDURE sp_Test AS SELECT 1",
-        "parameters": "[]", "operation_type": "query",
-    }
-    queries = [{"id": "vq-1", "name": "校验", "sql_code": "SELECT 1"}]
-    updates = []
-    query_updates = []
-    calls = []
+def test_generate_only_flows_to_verify_after_success():
+    from app.agent.graph import _after_generate
 
-    monkeypatch.setattr(nodes, "_get_writer", lambda _config=None: None)
-    monkeypatch.setattr(sqlite_db, "get_sps", lambda _session_id: [dict(sp)])
-    monkeypatch.setattr(sqlite_db, "get_verify_queries", lambda _sp_id: queries)
-    monkeypatch.setattr(
-        sqlite_db, "update_sp", lambda _sp_id, **changes: updates.append(changes),
-    )
-    monkeypatch.setattr(
-        sqlite_db, "update_verify_query",
-        lambda query_id, **changes: query_updates.append((query_id, changes)),
-    )
-
-    def validate(candidate, candidate_queries, params):
-        calls.append((candidate, candidate_queries, params))
-        return {
-            "sp_id": candidate["id"], "sp_name": candidate["name"],
-            "syntax_ok": True, "business_ok": True, "bundle_hash": "hash-1",
-            "details": [{
-                "type": "business", "query_id": "vq-1", "query": "校验",
-                "pass": True, "comparison": {"summary": "结果一致"},
-            }],
-        }
-
-    monkeypatch.setattr(validation, "validate_sp_bundle", validate)
-
-    result = nodes.verify_node({"session_id": "session-1", "sp_list": [sp]})
-
-    assert result["status"] == "verified"
-    assert len(calls) == 1
-    assert updates[-1]["validated_hash"] == "hash-1"
-    assert updates[-1]["status"] == "verified"
-    assert query_updates[-1][1]["status"] == "pass"
-    assert "code" not in updates[-1]
+    assert _after_generate({"status": "candidate_generated", "error": ""}) == "verify"
+    assert _after_generate({"status": "generate_failed", "error": "failed"}) == "end"
 
 
-def test_verify_node_retries_execution_failure_once(monkeypatch):
-    sp = {
-        "id": "sp-1", "name": "sp_Test", "code": "CREATE PROCEDURE sp_Test AS SELECT 1",
-        "parameters": "[]", "operation_type": "query",
-    }
-    queries = [{"id": "vq-1", "name": "校验", "sql_code": "SELECT 1"}]
-    attempts = []
+def test_check_syntax_compiles_procedure_against_real_objects(monkeypatch):
+    executed = []
 
-    monkeypatch.setattr(nodes, "_get_writer", lambda _config=None: None)
-    monkeypatch.setattr(sqlite_db, "get_sps", lambda _session_id: [dict(sp)])
-    monkeypatch.setattr(sqlite_db, "get_verify_queries", lambda _sp_id: queries)
-    monkeypatch.setattr(sqlite_db, "update_sp", lambda *_args, **_kwargs: None)
+    class _Cursor:
+        def execute(self, statement, *_params):
+            executed.append(statement)
+            if "CREATE PROCEDURE #compile_" in statement and "DocCurrency" in statement:
+                raise RuntimeError("Invalid column name 'DocCurrency'")
+            return self
 
-    def validate(candidate, _queries, _params):
-        attempts.append(candidate["id"])
-        if len(attempts) == 1:
-            return {
-                "sp_id": candidate["id"], "sp_name": candidate["name"],
-                "syntax_ok": True, "business_ok": False, "bundle_hash": "hash-1",
-                "details": [{"type": "execution", "pass": False, "error": "temporary"}],
-            }
-        return {
-            "sp_id": candidate["id"], "sp_name": candidate["name"],
-            "syntax_ok": True, "business_ok": True, "bundle_hash": "hash-1",
-            "details": [],
-        }
+    class _Connection:
+        def cursor(self):
+            return _Cursor()
 
-    monkeypatch.setattr(validation, "validate_sp_bundle", validate)
+        def close(self):
+            pass
 
-    result = nodes.verify_node({"session_id": "session-1", "sp_list": [sp]})
+    monkeypatch.setattr(sqlserver, "get_connection", lambda: _Connection())
 
-    assert len(attempts) == 2
-    assert result["status"] == "verified"
-
-
-def test_output_projection_excludes_data_source_and_filters():
-    projection = nodes._extract_sp_output_projection(
-        "CREATE PROCEDURE sp_Test AS "
-        "SELECT DocNum AS 发票编号, DocTotal - PaidToDate AS 余额 "
-        "FROM OINV WHERE CANCELED = 'N'"
+    ok, error = sqlserver.check_syntax(
+        "CREATE PROCEDURE sp_Test AS SELECT DocCurrency FROM OINV",
     )
 
-    assert "发票编号" in projection
-    assert "余额" in projection
-    assert "OINV" not in projection
-    assert "WHERE" not in projection
+    assert not ok
+    assert "DocCurrency" in error
+    assert any("CREATE PROCEDURE #compile_" in item for item in executed)
 
 
-def test_generate_flows_to_verify_node():
-    from app.agent.graph import create_graph
+def test_schema_context_includes_sap_user_table_and_field(monkeypatch):
+    class _Cursor:
+        rows = []
 
-    edges = create_graph().get_graph().edges
+        def execute(self, statement, *_params):
+            if "SELECT s.name, o.name, o.object_id" in statement:
+                self.rows = [
+                    ("dbo", "OINV", 1),
+                    ("dbo", "@CUSTOM", 2),
+                    ("dbo", "IGNORED", 3),
+                ]
+            else:
+                self.rows = [
+                    ("dbo", "OINV", "DocCur", "nvarchar", 6, 0, 0, 1, None),
+                    (
+                        "dbo", "@CUSTOM", "U_Color", "nvarchar", 40, 0, 0, 1,
+                        "自定义颜色",
+                    ),
+                ]
+            return self
 
-    assert any(
-        edge.source == "generate" and edge.target == "verify"
-        for edge in edges
+        def fetchall(self):
+            return self.rows
+
+    class _Connection:
+        def cursor(self):
+            return _Cursor()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(sqlserver, "get_connection", lambda: _Connection())
+
+    context = sqlserver.get_schema_context(
+        "从 OINV 关联 [@CUSTOM]，返回 U_Color",
     )
 
-
-def test_generate_keeps_old_artifacts_when_verify_sql_generation_fails(monkeypatch):
-    old_replaced = []
-    discarded = []
-    monkeypatch.setattr(nodes, "_get_writer", lambda _config=None: None)
-    monkeypatch.setattr(nodes, "_get_llm", lambda: type(
-        "Llm", (), {
-            "invoke": lambda self, _messages: AIMessage(content=(
-                '{"procedures":[{"name":"sp_New","operation_type":"query",'
-                '"code":"CREATE PROCEDURE sp_New AS SELECT 1 AS X"}]}'
-            ))
-        },
-    )())
-    monkeypatch.setattr(nodes, "save_sp", lambda *_args, **_kwargs: {
-        "id": "new-1", "name": "sp_New", "operation_type": "query",
-        "code": "CREATE PROCEDURE sp_New AS SELECT 1 AS X",
-        "parameters": "[]",
-    })
-    monkeypatch.setattr(
-        nodes, "_generate_verify_sql_for_sp",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("LLM failed")),
-    )
-    monkeypatch.setattr(sqlite_db, "get_verify_queries", lambda _sp_id: [])
-    monkeypatch.setattr(
-        sqlite_db, "delete_sps_except",
-        lambda *_args: old_replaced.append(True),
-    )
-    monkeypatch.setattr(
-        sqlite_db, "delete_sp", lambda sp_id: discarded.append(sp_id),
-    )
-
-    result = nodes.generate_node({
-        "session_id": "session-1", "design": "confirmed design",
-    })
-
-    assert "error" in result
-    assert old_replaced == []
-    assert discarded == ["new-1"]
+    assert "[dbo].[OINV]" in context
+    assert "DocCur: nvarchar(3)" in context
+    assert "[dbo].[@CUSTOM]" in context
+    assert "U_Color: nvarchar(20)" in context
+    assert "自定义颜色" in context
+    assert "IGNORED" not in context

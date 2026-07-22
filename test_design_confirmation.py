@@ -7,6 +7,11 @@ class _NoInvokeLLM:
         raise AssertionError("确认快捷动作不应调用 LLM 分类")
 
 
+class _CompiledSpec:
+    def model_dump(self, **_kwargs):
+        return {"design_version": "confirmed", "procedures": [{"name": "sp_Test"}]}
+
+
 def _state(phase: str | None) -> dict:
     return {
         "session_id": "test-session",
@@ -22,7 +27,33 @@ def _state(phase: str | None) -> dict:
         "clarify_count": 1,
         "design_phase": phase,
         "last_feedback_reply": "方案已按您的意见修改，请确认。",
+        "query_spec": {"design_version": "confirmed"},
     }
+
+
+def test_design_is_compiled_and_persisted_before_confirmation(monkeypatch):
+    state = _state(None)
+    state["query_spec"] = {}
+    monkeypatch.setattr(nodes, "_get_llm", lambda: _NoInvokeLLM())
+    monkeypatch.setattr(
+        nodes, "_compile_design_query_spec", lambda _llm, _design: _CompiledSpec(),
+    )
+    monkeypatch.setattr(
+        nodes, "_render_query_spec", lambda _spec: "结构化确认方案",
+    )
+    monkeypatch.setattr(
+        nodes, "interrupt",
+        lambda _value: (_ for _ in ()).throw(
+            AssertionError("固化 QuerySpec 的节点执行不应等待用户确认"),
+        ),
+    )
+
+    result = nodes.design_node(state)
+
+    assert result["mode"] == "design"
+    assert result["design_phase"] == "new"
+    assert result["query_spec"]["design_version"] == "confirmed"
+    assert result["design"] == "结构化确认方案"
 
 
 def test_confirm_action_after_redesign_enters_generate_without_llm(monkeypatch):

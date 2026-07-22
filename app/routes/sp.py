@@ -38,7 +38,7 @@ def api_update_sp(sp_id: str, req: UpdateSpRequest):
         raise HTTPException(400, "没有可更新的字段")
     changes.update(
         status="draft", syntax_valid=0, business_valid=0,
-        validated_hash=None, verify_result=None,
+        validated_hash=None, bundle_hash=None, verify_result=None,
     )
     update_sp(sp_id, **changes)
     return {"ok": True}

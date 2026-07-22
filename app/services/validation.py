@@ -60,6 +60,8 @@ def compute_bundle_hash(sp: dict, verify_queries: list[dict]) -> str:
         "code": sp.get("code", "").strip(),
         "parameters": _normalized_json_value(sp.get("parameters", "[]")),
         "operation_type": sp.get("operation_type", "query"),
+        "query_spec_json": _normalized_json_value(sp.get("query_spec_json", "{}")),
+        "schema_fingerprint": sp.get("schema_fingerprint", ""),
         "verify_queries": [
             {
                 "name": query.get("name", ""),

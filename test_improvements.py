@@ -115,13 +115,13 @@ params = list(sig.parameters.keys())
 check("有 3 个参数", len(params) == 3, str(params))
 check("返回类型是 tuple", True)  # 函数签名本身不强制返回类型
 
-# ====== 9. 校验 SQL 并行生成函数测试 ======
-print("\n=== 9. _generate_verify_sql_for_sp 函数签名测试 ===")
+# ====== 9. 独立 Oracle 候选函数测试 ======
+print("\n=== 9. _generate_oracle_candidates 函数签名测试 ===")
 
-from app.agent.nodes import _generate_verify_sql_for_sp
-sig2 = inspect.signature(_generate_verify_sql_for_sp)
+from app.agent.nodes import _generate_oracle_candidates
+sig2 = inspect.signature(_generate_oracle_candidates)
 params2 = list(sig2.parameters.keys())
-check("有 3 个参数", len(params2) == 3, str(params2))
+check("有 4 个参数", len(params2) == 4, str(params2))
 
 # ====== 10. chat.py SSE 端点结构测试 ======
 print("\n=== 10. chat.py 端点结构测试 ===")

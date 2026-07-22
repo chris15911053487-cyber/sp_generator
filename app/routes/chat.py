@@ -95,6 +95,7 @@ async def api_chat_stream(req: ChatRequest):
                         "clarify_count": state.values.get("clarify_count", 0) if state.values else 0,
                         "design_phase": state.values.get("design_phase") if state.values else None,
                         "last_feedback_reply": state.values.get("last_feedback_reply", "") if state.values else "",
+                        "query_spec": state.values.get("query_spec", {}) if state.values else {},
                     }
                     events = graph.astream(new_input, config, stream_mode=["updates", "custom"])
                 elif itype == "design" and req.action == "confirm_design":
@@ -111,15 +112,15 @@ async def api_chat_stream(req: ChatRequest):
                 mode = state.values.get("mode", "clarify")
                 status = state.values.get("status", "")
 
-                # 校验完成后用户追问 → 将用户反馈作为修改需求，重新生成
-                if status in ("verified", "verify_failed") and req.message.strip():
+                # 校验完成后用户追问 → 先更新并重新确认设计，再生成。
+                if status in ("persisted", "verify_failed", "needs_review") and req.message.strip():
                     # 把用户反馈追加到设计方案中作为修改要求
                     design = state.values.get("design", "")
                     modified_design = design + f"\n\n## 用户修改要求\n{req.message}"
                     input_state = {
                         "session_id": req.session_id,
                         "user_input": req.message,
-                        "mode": "generate",
+                        "mode": "design",
                         "requirements": state.values.get("requirements", ""),
                         "confirmed_assumptions": state.values.get("confirmed_assumptions", ""),
                         "design": modified_design,
@@ -128,8 +129,9 @@ async def api_chat_stream(req: ChatRequest):
                         "status": "",
                         "error": "",
                         "clarify_count": state.values.get("clarify_count", 0),
-                        "design_phase": None,
-                        "last_feedback_reply": "",
+                        "design_phase": "prepare_feedback",
+                        "last_feedback_reply": "已收到修改要求，正在更新方案。",
+                        "query_spec": {},
                     }
                     events = graph.astream(input_state, config, stream_mode=["updates", "custom"])
                 else:
@@ -150,6 +152,7 @@ async def api_chat_stream(req: ChatRequest):
                         "clarify_count": state.values.get("clarify_count", 0),
                         "design_phase": state.values.get("design_phase"),
                         "last_feedback_reply": state.values.get("last_feedback_reply", ""),
+                        "query_spec": state.values.get("query_spec", {}),
                     }
                     events = graph.astream(input_state, config, stream_mode=["updates", "custom"])
             else:
@@ -168,6 +171,7 @@ async def api_chat_stream(req: ChatRequest):
                     "clarify_count": 0,
                     "design_phase": None,
                     "last_feedback_reply": "",
+                    "query_spec": {},
                 }
                 events = graph.astream(input_state, config, stream_mode=["updates", "custom"])
 
@@ -190,23 +194,23 @@ async def api_chat_stream(req: ChatRequest):
                     # mode == "updates": 节点完成事件，保持原有逻辑
                     for node_name, node_output in data.items():
                         if isinstance(node_output, dict):
-                            if node_output.get("error"):
-                                # generate 等节点出错（如 LLM 响应解析失败）
+                            if node_output.get("error") and node_output.get("status") in ("design_failed", "generate_failed"):
                                 generate_failed = True
+                                label = "方案生成失败" if node_output.get("status") == "design_failed" else "生成失败"
                                 assistant_response = (
-                                    f"❌ 生成失败：{node_output['error'][:300]}\n\n"
-                                    "存储过程未能生成，右侧仍显示上一次的结果。请重新确认设计方案后重试。"
+                                    f"❌ {label}：{node_output['error'][:300]}\n\n"
+                                    "存储过程未能生成，右侧仍显示上一次的结果。"
                                 )
                                 yield f"data: {json.dumps({'type': 'error', 'content': assistant_response})}\n\n"
 
-                            if node_output.get("status") == "generated":
+                            if node_output.get("status") == "candidate_generated":
                                 sp_list = node_output.get("sp_list", [])
-                                assistant_response = f"已生成 {len(sp_list)} 个存储过程。\n"
+                                assistant_response = f"已生成 {len(sp_list)} 个内存候选。\n"
                                 for sp in sp_list:
                                     assistant_response += f"- {sp['name']}\n"
                                 assistant_response += "\n正在校验..."
 
-                            elif node_output.get("status") in ("verified", "verify_failed"):
+                            elif node_output.get("status") in ("persisted", "verify_failed", "needs_review"):
                                 # generate 已失败时跳过 verify 结果
                                 if generate_failed:
                                     yield f"data: {json.dumps({'node': node_name, 'data': node_output, 'type': 'update'})}\n\n"
@@ -214,7 +218,7 @@ async def api_chat_stream(req: ChatRequest):
                                 v_results = node_output.get("verify_results", [])
                                 print(f"[DEBUG verify_result] status={node_output.get('status')}, v_results count={len(v_results)}", flush=True)
                                 for i, vr in enumerate(v_results):
-                                    print(f"[DEBUG verify_result]   [{i}] sp_id={vr.get('sp_id','?')[:8]}, syntax_ok={vr.get('syntax_ok')}, biz_ok={vr.get('business_ok')}, details={len(vr.get('details',[]))}", flush=True)
+                                    print(f"[DEBUG verify_result]   [{i}] sp_id={str(vr.get('sp_id') or '?')[:8]}, syntax_ok={vr.get('syntax_ok')}, biz_ok={vr.get('business_ok')}, details={len(vr.get('details',[]))}", flush=True)
                                 lines = ["\n--- 校验结果 ---"]
                                 if v_results:
                                     for vr in v_results:
@@ -242,6 +246,12 @@ async def api_chat_stream(req: ChatRequest):
                                                 lines.append(f"   ❌ {label}: {d['error'][:120]}")
                                 else:
                                     lines.append("⚠️ 校验结果为空，可能未生成存储过程")
+                                if node_output.get("status") == "needs_review":
+                                    lines.append("⚠️ SP 与独立 Oracle 存在无法归因的差异；旧版本未被覆盖，请人工复核。")
+                                elif node_output.get("status") == "persisted":
+                                    lines.append("✅ 整批候选已通过并原子保存。")
+                                elif node_output.get("error"):
+                                    lines.append(f"❌ {node_output['error'][:300]}")
                                 assistant_response = "\n".join(lines)
                                 # 先持久化最终状态再推送 SSE；客户端此时断开也能在刷新后恢复结果。
                                 await asyncio.to_thread(
