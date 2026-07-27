@@ -1,0 +1,13 @@
+{
+  "database_collation": "SQL_Latin1_General_CP850_CI_AS",
+  "parameters": [
+    {"name": "@FromDate", "type": "DATETIME", "required": true, "default": null},
+    {"name": "@ToDate", "type": "DATETIME", "required": true, "default": null},
+    {"name": "@CardCode", "type": "NVARCHAR(50)", "required": false, "default": null},
+    {"name": "@DocStatus", "type": "NVARCHAR(10)", "required": false, "default": "ALL"}
+  ],
+  "verification_sql": [
+    "SELECT combined.DocNum FROM (SELECT inv.DocNum, inv.CardCode, inv.DocStatus FROM dbo.OINV inv WHERE inv.DocDate BETWEEN @FromDate AND @ToDate UNION ALL SELECT rcm.DocNum, rcm.CardCode, rcm.DocStatus FROM dbo.ORIN rcm WHERE rcm.DocDate BETWEEN @FromDate AND @ToDate) combined WHERE (@CardCode IS NULL OR combined.CardCode = @CardCode) AND (@DocStatus = 'ALL' OR combined.DocStatus = @DocStatus)",
+    "SELECT MIN(combined.DocTotal - combined.PaidToDate) AS UnpaidAmount FROM (SELECT inv.DocTotal, inv.PaidToDate, inv.CardCode, inv.DocStatus FROM dbo.OINV inv WHERE inv.DocDate BETWEEN @FromDate AND @ToDate UNION ALL SELECT rcm.DocTotal, rcm.PaidToDate, rcm.CardCode, rcm.DocStatus FROM dbo.ORIN rcm WHERE rcm.DocDate BETWEEN @FromDate AND @ToDate) combined WHERE (@CardCode IS NULL OR combined.CardCode = @CardCode) AND (@DocStatus = 'ALL' OR combined.DocStatus = @DocStatus)"
+  ]
+}

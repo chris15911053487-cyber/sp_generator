@@ -28,7 +28,7 @@ SYSTEM_PROMPT = f"""你是一个 SAP Business One 存储过程专家。你的任
 1. 理解用户的存储过程需求
 2. 提出关键问题以澄清需求
 3. 生成高质量、可直接部署的 T-SQL 存储过程
-4. 为每个存储过程生成基于同一业务契约、但实现独立的 Oracle SQL 用于业务数据校验
+4. 为每个存储过程生成基于同一业务契约、但实现独立的 Reference SQL 用于业务数据校验
 
 {B1_TABLE_KNOWLEDGE}
 
@@ -47,21 +47,17 @@ SYSTEM_PROMPT = f"""你是一个 SAP Business One 存储过程专家。你的任
 - 注释使用中文
 """
 
-CLARIFY_PROMPT = """基于用户的以下需求，你正在进行需求确认（当前是第 {q_num} 个问题，最多 5 个）。
-先分析需求涉及哪些 B1 模块和表，然后提出下一个最关键的问题。
+CLARIFY_PROMPT = """基于用户需求生成下一项结构化决策（当前最多还能询问第 {q_num} 项，总上限 5 项）。
 
-## 严格规则（必须遵守）
-- **只提出 1 个问题**，不要一次列多个问题，不要把多个子问题合并提问。
-- **不要自行编号**（系统会自动编号为 Q{q_num}），输出中不要出现"问题1""Q1"等编号字样。
-- 直接从问题正文开始，不要输出"基于已确认的信息""请确认"等开场语。
-- 问题应该具体、专业，用选择题形式呈现（A/B/C 选项）。
-- 不要把设计方案（SP 划分、参数等）当作确认问题来问——设计在后续阶段做。
-- 不要问关键业务假设（如过滤条件、计算口径）——这些在"关键项确认"阶段统一确认。
+## 决策分级
+- blocking：缺少答案就无法定义用户要求的功能、输入或输出。只有此类问题可以在当前阶段逐项询问。
+- defaultable：存在合理且可解释的建议默认值，可在后续“关键项确认”阶段一次性确认。不要把它伪装成 blocking。
+- 如果没有新的 blocking 决策，返回 sufficient。
 
-## 需要确认的方向
-1. **功能范围**：用户要实现什么功能、涉及哪些业务场景
-2. **输出要求**：需要返回哪些字段、排序方式、是否需要汇总
-3. **使用方式**：存储过程的调用场景（报表、接口、定时任务等）
+不得依据“金额、状态、过滤、计算”等主题词机械分级；应判断答案是否真正阻塞功能定义。
+不要询问 SP 划分、参数实现等设计细节。
+`decision_key` 描述决策本身，必须是稳定的小写英文 snake_case；不得包含问题编号。
+defaultable 的第一个选项必须是建议默认值，供关键项确认阶段兜底使用。
 
 用户需求：
 {user_input}
@@ -72,19 +68,102 @@ CLARIFY_PROMPT = """基于用户的以下需求，你正在进行需求确认（
 已确认的信息：
 {clarified_info}
 
-请提出第 {q_num} 个需要确认的问题（只 1 个）。{last_question_hint}
-如果信息已经足够充分，请回复 "INFO_SUFFICIENT" 并提供需求摘要。"""
+已确认的结构化决策：
+{clarify_decisions}
+
+{last_question_hint}
+
+只输出 JSON，不要输出 Markdown 或解释。二选一：
+
+{{
+  "action": "ask",
+  "decision_key": "stable_decision_key",
+  "decision_type": "blocking 或 defaultable",
+  "question": "一个完整且单一的问题",
+  "options": [
+    {{"id": "A", "value": "完整选项含义"}},
+    {{"id": "B", "value": "完整选项含义"}}
+  ],
+  "reason": "为什么该决策会阻塞，或为什么可以延后"
+}}
+
+或：
+
+{{
+  "action": "sufficient",
+  "summary": "包含已确认决策完整语义的需求摘要"
+}}"""
+
+DECISION_PLAN_PROMPT = """一次性分析用户需求，生成完整的业务决策清单。
+
+用户需求：
+{user_input}
+
+当前对话历史：
+{chat_history}
+
+规则：
+- 最多 5 个决策，每个决策只表达一个问题。
+- 本阶段只讨论业务语义。不得出现数据库、schema、表名、字段名、SQL、
+  `表.字段` 或 SAP 技术对象名；物理绑定必须等用户确认业务方案后进行。
+- 输出列使用面向业务的稳定名称，不得复用模型记忆中的 SAP 物理字段名。
+- blocking：没有答案就无法确定功能、输入或输出。
+- defaultable：存在合理建议值，可在关键项确认阶段集中确认。
+- 不按“金额、状态、过滤”等主题词机械分类。
+- 不询问 SP 拆分、SQL 写法等实现细节。
+- 当前阶段每个存储过程只支持一个结果集；不得提供或推荐“汇总结果集 +
+  明细结果集”等多结果集选项。需要汇总与明细时，必须定义为同一结果集的
+  单一稳定形态，否则作为阻塞决策要求用户二选一。
+- decision_key 必须稳定、使用小写英文 snake_case。
+- defaultable 必须给 recommended_option_id。
+- 如果信息已经充分，decisions 可以为空。
+- 只输出 JSON，不要 Markdown。
+
+格式：
+{{
+  "action": "plan",
+  "requirements_summary": "保留用户原意的需求摘要",
+  "decisions": [
+    {{
+      "decision_key": "stable_key",
+      "decision_type": "blocking 或 defaultable",
+      "question": "单一问题",
+      "options": [
+        {{"id": "A", "value": "完整选项含义"}},
+        {{"id": "B", "value": "完整选项含义"}}
+      ],
+      "reason": "为什么需要该决策",
+      "recommended_option_id": null,
+      "contract_relevant": true
+    }}
+  ]
+}}"""
 
 ASSUMPTIONS_PROMPT = """基于已确认的需求，列出所有影响最终结果的关键业务假设，供用户逐项确认。
 
 需求摘要：
 {requirements}
 
+澄清阶段已确认的决策（不得再次生成相同 key）：
+{clarify_decisions}
+
+澄清阶段识别并延后的可默认决策（必须优先纳入）：
+{deferred_decisions}
+
 ## 输出要求
 - 列出所有需要用户确认的关键项（通常 3~8 项）
+- 只讨论业务口径，不得出现数据库、schema、表名、字段名、SQL 或
+  `表.字段`；例如应问“税额采用发票税额”，不能问“选择哪个物理字段”。
 - 每个关键项包含：标题（简短）、默认值/建议值、说明（为什么需要确认）
 - 关键项应覆盖：过滤条件、计算口径、数据范围、状态判断、特殊处理逻辑等
+- 涉及金额统计或跨来源对账时，必须逐项检查尚未确认的含税/不含税口径、
+  币种口径、借贷方向与符号、作废/冲销处理、匹配粒度；有合理默认值也必须
+  作为关键项列出，不能静默假设。
 - 只列影响结果的项，不要列显而易见的内容
+- 延后决策沿用其 decision_key 作为 key
+- 不得重复已确认决策中的 decision_key
+- 当前阶段每个存储过程只支持一个结果集；不得建议同时返回彼此独立的汇总
+  与明细结果集。
 
 ## 输出 JSON 格式（只输出 JSON）
 ```json
@@ -99,8 +178,8 @@ ASSUMPTIONS_PROMPT = """基于已确认的需求，列出所有影响最终结�
     {{
       "key": "amount_type",
       "title": "金额口径",
-      "value": "含税金额（DocTotal）",
-      "reason": "可选含税(DocTotal)或不含税(DocTotal-VatSum)，影响汇总结果"
+      "value": "不含税销售收入",
+      "reason": "含税价款与不含税收入的业务含义不同，会直接影响对账结果"
     }}
   ]
 }}
@@ -192,6 +271,80 @@ QuerySpec JSON Schema：
 - 只输出 JSON，不要 Markdown。
 """
 
+QUERY_SPEC_DESIGN_PROMPT = """根据已确认需求直接生成设计契约，不要先生成 Markdown 方案。
+
+需求：
+{requirements}
+
+已确认的澄清决策：
+{clarify_decisions}
+
+已确认的关键项：
+{confirmed_assumptions}
+
+现有契约与用户修改要求（首次设计为空）：
+{revision_context}
+
+QuerySpec JSON Schema：
+{schema}
+
+严格要求：
+- 可以调用 Schema 工具核对表和字段；最终只输出 JSON。
+- 最终格式必须是 {{"summary":"中文方案摘要","query_spec":{{...}}}}。
+- query_spec 必须严格符合 JSON Schema。
+- contract_version 必须为 3。
+- 每个参数必须声明 boundary：普通参数用 none；日期起点用 inclusive；
+  日期终点若覆盖整个自然日必须用 inclusive_full_day。
+- 每条 filters 必须是原子业务条件并声明 operator；常量条件写入 literal_values，
+  参数条件写入 parameter_refs。日期自然日范围用 full_day_range 和两个日期参数。
+- 只能使用当前数据库中已核对的表和字段。
+- 每个 procedure 必须声明 result_contract.cardinality（one/many/none）。
+- one 结果使用 scalar；many 结果使用 keyed_rows、multiset_rows 或 aggregate。
+- aggregate 必须声明 metrics，区分 actual_column 与 expected_column。
+- keyed_rows 必须声明 key_columns 和 compare_columns。
+- multiset_rows 用于没有稳定业务键的多行结果。
+- zero_rows 只能作为 supplemental 不变量，使用 evidence_columns 返回异常明细，
+  不能替代直接结果对账，也不要生成“结果必须非空”规则。
+- change_set 必须声明 writes 中唯一对应的 target_table 和目标表物理 compare_columns；
+  多个写入目标必须各有一条规则。
+- 查询型过程至少有一条 direct 结果对账规则。
+- 所有规则引用的业务列只能使用 outputs.name。
+- 数据库物理字段只能出现在 source_columns、joins、filters 或 grain。
+- 用户已经确认的业务决策不得被改写。
+- 不得增加用户没有要求的输出、过滤、写入或存储过程。
+"""
+
+QUERY_SPEC_DESIGN_REPAIR_PROMPT = """下面的设计契约未通过严格校验，请只修正列出的契约问题。
+
+已确认需求：
+{requirements}
+
+已确认决策：
+{decisions}
+
+上一次 DesignEnvelope：
+{response}
+
+结构化错误：
+{errors}
+
+QuerySpec JSON Schema：
+{schema}
+
+严格要求：
+- 返回完整 {{"summary":"...","query_spec":{{...}}}} JSON。
+- contract_version 必须为 3，参数必须显式声明 boundary。
+- filters 必须保留 operator、literal_values、column_refs 和 parameter_refs。
+- 不得修改用户确认的业务口径。
+- 修正 result_contract 与验证模式的适用性；many 不得使用 scalar。
+- aggregate 使用 metrics；keyed_rows 使用 key_columns/compare_columns；
+  zero_rows 使用 evidence_columns 且只能作为 supplemental。
+- 查询型过程必须保留至少一条 direct 对账规则。
+- 所有规则列引用只能使用 outputs.name。
+- 物理字段与输出名只有唯一对应时才可改为输出名；有歧义时不得猜测。
+- 只输出 JSON，不要 Markdown。
+"""
+
 
 PROCEDURE_CANDIDATE_PROMPT = """根据下面唯一的业务契约和实时 Schema 证据，生成一个 SQL Server 存储过程候选。
 
@@ -224,14 +377,22 @@ ORACLE_CANDIDATE_PROMPT = """根据下面唯一的业务契约和实时 Schema �
 SchemaEvidence（fingerprint={schema_fingerprint}）：
 {schema_evidence}
 
+程序确定性编译的 Oracle 任务（输出结构必须精确匹配）：
+{oracle_tasks}
+
 独立性要求：
 - 你没有也不得请求存储过程源码；不得从 SP 实现推导 SQL。
 - QuerySpec 决定业务语义，SchemaEvidence 决定物理表、字段和类型。
-- 每条 verification_rule 必须恰好生成一条规则，名称、mode、required_columns 必须一致。
+- 每条 verification_rule 必须恰好生成一条规则，名称必须一致。
 - SQL 仅允许单条 SELECT 或 WITH...SELECT，必须使用 schema-qualified 名称。
-- compare_columns 使用逗号分隔字符串。
-- validation_spec 至少包含 mode、required=true、compare_columns；change_set 还必须包含契约声明的 affected_tables。
-- 只输出 JSON：{{"verify_queries":[{{"name":"规则名","sql_code":"SELECT...","compare_columns":"列1,列2","validation_spec":{{}}}}]}}。
+- 参数必须使用 ProcedureSpec 中声明的 SQL Server 原生名称（例如 @FromDate）；
+  不得使用花括号占位符、问号占位符或拼接固定值。
+- mode、role、比较列、键、聚合指标、容差和写入范围由程序从 QuerySpec
+  编译，不要重复解释或修改。
+- scalar/aggregate Oracle 必须返回任务要求的单行指标列。
+- keyed_rows/multiset_rows Oracle 必须返回任务要求的业务输出别名。
+- zero_rows 必须返回异常明细证据；禁止用 COUNT(*) 聚合成一行。
+- 只输出 JSON：{{"verify_queries":[{{"name":"规则名","sql_code":"SELECT..."}}]}}。
 """
 
 
@@ -259,6 +420,9 @@ REPAIR_ORACLE_CANDIDATE_PROMPT = """只修复下面独立 Oracle 候选的确定
 ProcedureSpec：
 {procedure_spec}
 
+不可变 VerificationPlan：
+{verification_plan}
+
 SchemaEvidence（fingerprint={schema_fingerprint}）：
 {schema_evidence}
 
@@ -268,8 +432,55 @@ SchemaEvidence（fingerprint={schema_fingerprint}）：
 当前 Oracle 候选：
 {verify_queries}
 
-不得改变规则名称、mode、required_columns、筛选、粒度或业务含义。不得参考存储过程源码。
-只输出 JSON：{{"verify_queries":[{{"name":"规则名","sql_code":"SELECT...","compare_columns":"列1,列2","validation_spec":{{}}}}]}}。
+不得改变规则名称、mode、输出形状、筛选、粒度或业务含义。不得参考存储过程源码。
+参数必须使用 ProcedureSpec 中声明的 SQL Server 原生名称（例如 @FromDate）。
+zero_rows 必须返回 VerificationPlan 的异常证据列，禁止用 COUNT(*) 聚合成一行。
+其他模式必须精确返回 VerificationPlan 的 expected_schema。
+契约字段由程序从 QuerySpec 注入，不要输出或修改。
+只输出 JSON：{{"verify_queries":[{{"name":"规则名","sql_code":"SELECT..."}}]}}。
+"""
+
+
+RELATIONAL_PLAN_V3_PROMPT = """把业务合同编译成受限 RelationalPlan JSON。
+
+生成角色：{role}
+
+SemanticContract（唯一业务语义来源）：
+{semantic_contract}
+
+SchemaBinding（唯一物理对象来源）：
+{schema_binding}
+
+RelationalPlan JSON Schema：
+{plan_schema}
+
+严格要求：
+- 只输出完整 RelationalPlan JSON，不要 Markdown。
+- 只能使用 SchemaBinding 中的 entity_id 和 field_binding_id。
+- SemanticContract.filters.field_ids 对应 SchemaBinding.fields.semantic_id；
+  每条结构化过滤必须逐条落实 operator、parameter_ids 和 literal_values，不能只参考自然语言。
+- 输出列的名称、顺序、类型必须与消息末尾给出的确定性 result_schema 完全一致；
+  Procedure 使用完整输出，Reference Fact 可以只使用其独立事实投影。
+- 只能使用 scan/join/filter/project/aggregate/union_all/sort。
+- 表达式只能使用 column/output/parameter/literal/binary/unary/function/case/cast。
+- binary 只允许 =、<>、>、>=、<、<=、AND、OR、+、-、*、/、LIKE；
+  unary 只允许 NOT、IS NULL、IS NOT NULL、NEGATE；
+  function 只允许 ABS、AVG、COALESCE、CONCAT、COUNT、DATEADD、DATEDIFF、
+  DATEFROMPARTS、EOMONTH、LOWER、LTRIM、MAX、MIN、MONTH、NULLIF、RTRIM、
+  SUM、UPPER、YEAR。
+- SQL Server 编译结果与 result_schema 类型不一致时，只能使用受控
+  cast 表达式：{{"kind":"cast","target_type":"date","args":[一个表达式]}}。
+  禁止把 CAST/CONVERT 写成 function，禁止任意 SQL 类型文本。
+- 派生输出可以按 SemanticContract 公式引用其他输出名；系统会确定性编译为嵌套
+  project，禁止改写或重复业务公式。
+- 禁止输出 SQL 文本、表名、列名、临时表、动态 SQL 或存储过程。
+- 日期终点 boundary=inclusive_full_day 时，必须表达为
+  column < DATEADD(day, 1, @结束参数)，不能使用 <= @结束参数。
+- join 必须遵循 SchemaBinding.joins，禁止添加未经确认的关系。
+- 聚合只在业务合同明确要求时使用；不得增加输出或过滤。
+- sort 只能引用其输入已经输出的名称，不得在聚合查询中偷偷加入非输出列。
+- role=reference 时独立表达业务事实；role=procedure 时同样只依据本消息中的
+  SemanticContract 与 SchemaBinding，不会提供也不得请求 Reference SQL。
 """
 
 
@@ -359,7 +570,7 @@ SP 输出投影（仅用于识别实际输出列名和别名）：
   "verify_queries": [
     {{
       "name": "校验_XXX",
-      "sql_code": "SELECT\\n    SUM(DocTotal) AS TotalAmount\\nFROM OINV\\nWHERE DocDate BETWEEN {{FromDate}} AND {{ToDate}}",
+      "sql_code": "SELECT\\n    SUM(DocTotal) AS TotalAmount\\nFROM OINV\\nWHERE DocDate BETWEEN @FromDate AND @ToDate",
       "compare_columns": "TotalAmount",
       "validation_spec": {{
         "mode": "aggregate",
@@ -391,25 +602,25 @@ SP 输出投影（仅用于识别实际输出列名和别名）：
 
 ## 关键要求（必须严格遵守）
 
-### 1. 校验 SQL 中的参数使用 {{参数名}} 占位符
+### 1. 校验 SQL 使用 SQL Server 原生命名参数
 - change_set 示例：affected_tables 为 [{{"table":"dbo.TestOrders","operation":"delete","key_columns":["DocEntry"],"compare_columns":["DocTotal"],"max_affected_rows":1}}]
 - 对应 sql_code 返回 ChangeType、DocEntry、Before_DocTotal、After_DocTotal，snapshot_sql 返回 DocEntry、DocTotal
-- ✅ 正确: WHERE DocDate BETWEEN {{FromDate}} AND {{ToDate}}
-- ✅ 正确: WHERE CardCode = {{CardCode}}
-- ❌ 错误: WHERE DocDate BETWEEN @FromDate AND @ToDate
+- ✅ 正确: WHERE DocDate BETWEEN @FromDate AND @ToDate
+- ✅ 正确: WHERE CardCode = @CardCode
+- ❌ 错误: WHERE DocDate BETWEEN {{FromDate}} AND {{ToDate}}
 - ❌ 错误: WHERE DocDate BETWEEN '<起始日期>' AND '<结束日期>'
-- 占位符名称应与 SP 的 @参数名 对应（去掉 @ 前缀）
-- parameters 数组中必须列出所有占位符参数，并给出 type 和 default 值
+- 参数名称必须与 SP 的 @参数名完全对应
+- parameters 数组中必须列出所有参数，并给出 type 和 default 值
 
 ### 2. 表名和列名必须准确
 - 只能使用上方实时 schema 中存在的表和字段
 - 注意常见易错点：OINV 用 CANCELED(Y/N) 而非 Cancelled，用 DocStatus 而非 Status
 - 禁止使用不存在的表名、视图名或列名
 
-### 3. SQL 必须可执行（替换占位符后）
+### 3. SQL 必须可参数化执行
 - 每条 SQL 是独立的 SELECT 语句，不依赖任何变量、临时表或 SP 输出
 - 禁止使用 DECLARE、CREATE、EXEC 等语句
-- 占位符 {{param}} 会被系统自动替换为用户输入的参数值
+- @参数由系统按 QuerySpec 类型安全绑定，不得自行拼接或改写参数值
 
 ### 4. 校验逻辑简单明确
 - 优先用 SUM/COUNT/AVG 等聚合做总量校验
@@ -522,11 +733,117 @@ FIX_VERIFY_SQL_PROMPT = """以下校验 SQL 执行失败，请只修复校验 SQ
 ## 修复要求
 - 保持原校验目的、输出列和筛选逻辑不变
 - 只修复 SQL Server 语法、保留字或字段引用错误
-- 保留 {{参数名}} 占位符，不要改成固定值
+- 保留 SQL Server 原生 @参数名，不要改成固定值或花括号占位符
 - 只输出 JSON，不要包含 Markdown
 
 请输出：
 {{
   "fixed_sql": "修复后的完整校验 SQL"
 }}
+"""
+RESULT_CONTRACT_PROMPT = """你正在构建存储过程的“最终结果契约”。
+
+只回答用户最终要得到什么，不回答数据从哪里来、如何查询或如何计算。
+禁止出现数据库、schema、表、列、SQL、实体、事实、源字段和表达式。
+输出必须严格符合给定 JSON Schema，且只输出 JSON。
+
+要求：
+- 只输出差异、异常、未匹配记录的业务口径必须使用 result_mode=exception_rows，
+  并声明 effect=result_selection 的业务政策；不得与 full_rows 同时出现。
+- full_rows 表示输出全部结果，不得声明“仅输出差异/异常”的 result_selection 政策。
+- 输出列逐一对应用户需求，不增添实现辅助列。
+- 输出 name 必须使用业务名称（如 DocumentId、DocumentNumber、DocumentAmount），
+  禁止使用 DocEntry、DocNum、DocTotal 等数据库物理字段名。
+- 非 scalar_summary 结果必须从已声明 outputs.symbol 中选择 grain_output_symbols。
+- business_policies 必须与所有 contract_relevant 的已确认 decision key 一一对应，
+  不得遗漏，也不得新增未经确认的政策。
+- business_policies.value 必须逐字复制已确认 decision 的 value，不得概括、改写或缩短。
+- 每项政策必须填写 key、value、meaning 和 effect。effect 只能按政策实际影响选择：
+  source_population=限定某个业务事实的数据总体；
+  calculation=改变某个事实维度或指标的计算；
+  matching=改变事实之间如何关联、以及保留左侧/匹配/双侧记录；
+  result_selection=决定最终保留哪些结果，包括差异阈值或金额容差；
+  presentation=只影响契约展示，不改变数据计算。
+- money_tolerance 是金额比较容差；没有金额也保留合理的非负值。
+- 单一“截止日期/截至日期”参数的 boundary 使用 inclusive，后续采用 lte 过滤；
+  inclusive_full_day 只用于同时存在开始、结束两个参数的自然日区间结束参数，
+  开始参数必须为 inclusive。
+"""
+
+
+FACT_BLUEPRINT_PROMPT = """你正在构建存储过程的“业务事实蓝图”。
+
+只描述哪些相互独立的业务事实能够证明最终结果，以及事实之间如何匹配。
+不要描述数据库、schema、物理表列、SQL 或最终表达式。
+输出必须严格符合给定 JSON Schema，且只输出 JSON。
+
+要求：
+- 每个事实代表可从底层业务记录独立证明的数据来源。
+- 禁止创建 final_result、sp_result、procedure_result 一类伪事实。
+- 每个事实的 grain 只能引用本事实已经声明的 dimension symbol。
+- 每个维度必须冻结 logical_type；若映射结果输出，类型必须完全一致。
+- 事实关联两侧维度的 logical_type 必须一致。
+- 多事实必须用 joins 形成连通图。
+- entity_symbols 是下一阶段必须落实的业务实体符号。
+- result_output_symbol 只能引用结果契约已经声明的 output symbol。
+- 每个最终 output 必须恰好归属一次：
+  直接来自事实值的，在对应 dimension 或 measure 填 result_output_symbol；
+  需要跨事实计算、差额或状态公式的，写入 derived_output_symbols。
+- 不允许遗漏输出，也不允许同一输出同时绑定多个事实值或又声明为派生输出。
+- policy_targets 的字段由程序根据 ResultContract 的每项政策动态生成，全部必填，
+  不得删除、改名或增加字段。
+- source_population 槽位填写一个或多个目标事实；
+  calculation 槽位填写一个或多个目标事实值；
+  matching 槽位填写一个或多个目标 join 及其匹配模式。
+- result_selection 和 presentation 槽位只填写空对象；其 binding kind 和 policy key
+  由程序写入，模型不得重复填写或改变。
+- matching 表示改变事实关联及保留哪侧记录，必须指向 joins；
+  不能因为它也影响最终展示就把它当作 presentation。
+- 日期参数等普通查询条件不是业务政策，不要创建政策目标。
+"""
+
+
+COMPUTATION_BLUEPRINT_PROMPT = """你正在构建存储过程的“业务计算蓝图”。
+
+业务公式必须在底层来源字段之前冻结。你只能填写程序动态生成的事实值槽位、
+结果输出槽位和结果过滤槽位；不能填写或修改 fact、value、output 的目标 ID，
+不能出现数据库、schema、物理表列或 SQL。输出必须严格符合给定 JSON Schema，
+且只输出 JSON。
+
+要求：
+- 每个非 count_rows 事实值必须声明业务输入，并用结构化 expression 消费全部输入。
+- input 只表示底层业务含义，例如数量、单位成本、借方金额、贷方金额；
+  不得把净额、差额、库存金额等公式结果伪装成 input。
+- 事实公式只能引用本槽位声明的 input，不允许引用参数、输出或其他事实值。
+- 结果公式只能引用已冻结 fact_value、其他输出、参数和 literal。
+- 结果过滤只能引用输出、参数和 literal。
+- 数量乘成本、贷方减借方、含税额减税额、外币额乘汇率、两端金额相减等，
+  必须完整表达为结构化公式，不能用一个派生 input 绕过。
+- exception_rows 必须填写 boolean result_filter；其他模式不得填写。
+"""
+
+
+SOURCE_REQUIREMENTS_PROMPT = """你正在构建存储过程的“底层业务源需求”。
+
+只描述实现已冻结输入所需的单粒度业务实体和业务过滤。
+不要猜测数据库、schema、物理表名、列名或 SQL，也不要把派生金额、期间、
+净额、差额等计算结果伪装成底层字段。
+输出必须严格符合给定 JSON Schema，且只输出 JSON。
+
+要求：
+- 单据头、单据行、凭证头、凭证明细、科目分类等不同粒度必须拆成独立实体。
+- required_inputs 的每个字段都是输入义务编译器生成的必填槽位；只能补充实体归属、
+  业务含义和已冻结的可空性，不能删除、改名或增加槽位。
+- required_inputs.entity_symbol 必须引用本阶段声明的实体。
+- 必须完整实现事实蓝图中出现的 entity_symbols。
+- ordinary_filters 只用于参数或普通业务条件，不能填写或发明 policy_key。
+- policy_filters 的每个字段都是上游义务编译器生成的必填槽位，必须逐项实现；
+  不能删除、改名、增加槽位，也不能修改其政策 key 和目标事实。
+- ordinary_filters 的 source_symbol 只能引用 required_inputs 的动态槽位；
+  参数只能引用结果契约参数。
+- 单一截止日期使用 lte 且只引用一个 inclusive 参数；between 和
+  full_day_range 必须引用开始、结束两个参数，其中 full_day_range 的边界必须是
+  inclusive / inclusive_full_day。
+- 当过滤使用 required=false 且 default=null 的单个可选参数时，必须设置
+  skip_when_parameter_null=true，表示参数为空时不应用该过滤；必填参数不得设置。
 """

@@ -122,8 +122,8 @@ def test_invalid_reference_in_conditional_branch_is_rejected():
     assert result["executed"] is False
 
 
-def test_temporary_procedure_is_cleaned_after_failure():
-    compile_candidate(
+def test_procedure_compile_does_not_create_temporary_procedure():
+    result = compile_candidate(
         "procedure",
         "sp_HarnessCleanup",
         (
@@ -140,4 +140,5 @@ def test_temporary_procedure_is_cleaned_after_failure():
     count = cursor.fetchone()[0]
     conn.close()
 
+    assert result["method"] == "procedure_body_sp_describe"
     assert count == 0

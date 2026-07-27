@@ -17,7 +17,7 @@ main { display: flex; flex: 1; overflow: hidden; }
 #chat-messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
 #chat-messages .message { max-width: 80%; padding: 10px 14px; border-radius: 12px; line-height: 1.5; font-size: 14px; word-break: break-word; }
 #chat-messages .user { align-self: flex-end; background: #6c5ce7; color: #fff; white-space: pre-wrap; }
-#chat-messages .assistant { align-self: stretch; width: 100%; max-width: 100%; min-width: 0; background: #fff; border: 1px solid #dfe6e9; }
+#chat-messages .assistant { align-self: flex-start; width: fit-content; max-width: 100%; min-width: 0; box-sizing: border-box; background: #fff; border: 1px solid #dfe6e9; }
 #chat-messages .system { align-self: center; font-size: 12px; color: #636e72; white-space: pre-wrap; }
 #chat-messages .error { align-self: flex-start; background: #ff7675; color: #fff; }
 
@@ -99,6 +99,14 @@ main { display: flex; flex: 1; overflow: hidden; }
 .sp-status.draft { background: #ffeaa7; color: #d63031; }
 .sp-status.verified { background: #55efc4; color: #00b894; }
 .sp-status.verify_failed { background: #fab1a0; color: #d63031; }
+.sp-status.needs_review { background: #ffeaa7; color: #b7791f; }
+.validation-stages { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: center; }
+.validation-stage { font-size: 11px; white-space: nowrap; }
+.validation-stage.passed { color: #008f72; }
+.validation-stage.failed { color: #d63031; font-weight: 600; }
+.validation-stage.inconclusive { color: #b7791f; font-weight: 600; }
+.validation-stage.running { color: #0984e3; }
+.validation-stage.not_run { color: #7f8c8d; }
 .sp-status.deployed { background: #74b9ff; color: #0984e3; }
 
 /* ====== SP Code Section ====== */
@@ -131,6 +139,7 @@ main { display: flex; flex: 1; overflow: hidden; }
 .sp-actions {
     display: flex; align-items: center; gap: 8px; margin-top: 8px;
 }
+.v3-locked-hint { font-size: 12px; color: #636e72; flex: 1; }
 .verify-btn {
     padding: 6px 14px; border: 1px solid #0984e3; border-radius: 4px;
     background: #fff; color: #0984e3; cursor: pointer; font-size: 13px;
@@ -192,6 +201,34 @@ main { display: flex; flex: 1; overflow: hidden; }
 .spr-row:last-child { border-bottom: none; }
 .spr-row.pass { color: #00b894; }
 .spr-row.fail { color: #d63031; }
+
+.v3-conclusion {
+    display: flex; justify-content: space-between; gap: 12px;
+    margin-bottom: 8px; padding: 9px 11px; border-radius: 6px;
+    font-size: 13px;
+}
+.v3-conclusion.passed { background: #e8fff7; color: #007d65; }
+.v3-conclusion.failed { background: #fff0f0; color: #c0392b; }
+.v3-conclusion.inconclusive { background: #fff8e6; color: #9a6700; }
+.v3-issue-card, .v3-comparison {
+    margin-top: 8px; padding: 9px 11px; border: 1px solid #e1e5ea;
+    border-radius: 6px; background: #fff;
+}
+.v3-issue-card.failed, .v3-comparison.failed { border-left: 4px solid #d63031; }
+.v3-issue-card.inconclusive { border-left: 4px solid #e1a600; }
+.v3-issue-location, .v3-repair-boundary { margin-top: 6px; color: #566; font-size: 12px; }
+.v3-diff-pager { display: flex; flex-wrap: wrap; gap: 4px; margin: 6px 0; }
+.v3-diff-pager button { min-width: 28px; padding: 2px 6px; }
+.v3-comparison.passed { border-left: 4px solid #00b894; }
+.v3-issue-title { font-weight: 600; color: #2d3436; }
+.v3-issue-title code { margin-left: 5px; font-size: 10px; color: #636e72; }
+.v3-issue-summary, .v3-user-action { margin-top: 4px; font-size: 12px; }
+.v3-user-action { color: #636e72; }
+.v3-issue-card details, .v3-comparison details { margin-top: 6px; font-size: 11px; }
+.v3-issue-card pre, .v3-comparison pre {
+    max-height: 240px; overflow: auto; margin: 5px 0 0; padding: 7px;
+    border-radius: 4px; background: #f5f6fa; color: #2d3436;
+}
 
 /* 数据对比表格 */
 .compare-table { width: 100%; border-collapse: collapse; margin-top: 6px; font-size: 11px; }
@@ -775,6 +812,20 @@ main { display: flex; flex: 1; overflow: hidden; }
     border-radius: 6px;
     font-size: 13px;
     box-sizing: border-box;
+}
+
+.schema-candidate-select {
+    width: 100%;
+    margin-top: 10px;
+    padding: 9px 10px;
+    border: 1px solid #d8d5ea;
+    border-radius: 8px;
+    background: #fff;
+    color: #2d2a3a;
+}
+
+.schema-choice-block .schema-issue {
+    display: block;
 }
 .assumption-input:focus {
     outline: none;

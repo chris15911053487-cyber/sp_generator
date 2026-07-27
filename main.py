@@ -6,11 +6,22 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
-sys.path.insert(0, os.path.dirname(__file__))
+project_dir = os.path.dirname(__file__)
+sys.path.insert(0, project_dir)
+
+# 部分 Windows 后台启动器会丢失 PATH；httpx/trio 初始化时仍会读取它。
+if os.name == "nt" and "PATH" not in os.environ:
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
+    os.environ["PATH"] = os.pathsep.join([
+        os.path.dirname(sys.executable),
+        sys.base_prefix,
+        os.path.join(system_root, "System32"),
+        system_root,
+    ])
 
 from config import init_config
 from app.db.sqlite import init_db
-from app.routes import session, config_routes, chat, sp, verify, deploy
+from app.routes import session, config_routes, chat, sp, deploy, v3
 
 init_config()
 init_db()
@@ -24,8 +35,8 @@ app.include_router(session.router)
 app.include_router(config_routes.router)
 app.include_router(chat.router)
 app.include_router(sp.router)
-app.include_router(verify.router)
 app.include_router(deploy.router)
+app.include_router(v3.router)
 
 templates_dir = os.path.join(os.path.dirname(__file__), "app", "templates")
 templates = Jinja2Templates(directory=templates_dir)

@@ -3,4 +3,9 @@ data/
 __pycache__/
 *.pyc
 .superpowers/
+.codex-runtime/
+.pytest_cache/
+.pytest_tmp*/
+.e2e*.log
+AGENTS-backup.md
 seed_config.py

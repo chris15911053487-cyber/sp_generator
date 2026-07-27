@@ -80,67 +80,6 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 
 Codex 在修改代码后应主动执行与改动相匹配的测试，不必等待用户再次要求。测试失败时先定位并修复，再重复测试；不得只报告失败后停止。
 
-### Linux / Docker 环境
-
-当前 Linux 工作区没有宿主机 Python，项目的可靠测试环境是 Docker。 `pytest==8.4.1` 已写入 `requirements.txt`。不要在宿主机全局安装 Python 包。
-
-测试文件被 `.dockerignore` 的 `test_*.py` 排除，因此运行测试时需把项目目录只读挂载到 `/workspace`。禁用 pytest 缓存可避免只读目录警告。
-
-每次代码改动至少依次执行：
-
-1. 检查补丁格式：
-
-```bash
-git diff --check
-```
-
-2. 如果应用代码或依赖有变化，构建最新测试镜像：
-
-```bash
-docker compose build sp-generator
-```
-
-3. 检查应用代码语法：
-
-```bash
-docker compose run --rm --no-deps sp-generator python -m compileall -q app
-```
-
-4. 优先运行与改动直接相关的测试。例如方案确认流程：
-
-```bash
-docker compose run --rm --no-deps \
-  -v "$PWD:/workspace:ro" \
-  sp-generator pytest -q -p no:cacheprovider \
-  /workspace/test_design_confirmation.py
-```
-
-5. 运行当前不依赖真实 LLM、SQL Server 或已启动服务的单元测试集合：
-
-```bash
-docker compose run --rm --no-deps \
-  -v "$PWD:/workspace:ro" \
-  sp-generator pytest -q -p no:cacheprovider \
-  /workspace/test_clarify.py \
-  /workspace/test_invoke_mock.py \
-  /workspace/test_design_confirmation.py \
-  /workspace/test_verify_autofix.py
-```
-
-上述单元测试命令已验证可用，当前结果为 `12 passed`。
-
-### 服务部署后的检查
-
-只有任务包含部署或要求更新正在运行的服务时，才执行：
-
-```bash
-docker compose up -d --force-recreate sp-generator
-docker compose ps
-docker compose logs --tail=80 sp-generator
-curl -fsS -o /dev/null -w 'HTTP %{http_code}\n' http://127.0.0.1:8000/
-```
-
-成功标准：容器状态为 `Up`、启动日志包含 `Application startup complete`、首页返回 `HTTP 200`。服务刚启动不足一秒时首次请求可能被重置，应查看日志后再重试一次。
 
 ### 集成测试与 E2E 限制
 

@@ -1,83 +1,103 @@
-"""部署管理 API：资格检查与唯一持久化部署入口。"""
+"""V3 部署入口：只认可冻结制品链和 ValidationEvidence。"""
+
 import datetime
 import json
 
 from fastapi import APIRouter
 
-from app.db.sqlite import get_sps, get_verify_queries, update_sp
-from app.db.sqlserver import _deployable_code, check_syntax, deploy_procedures_atomically
-from app.services.generation_harness import QuerySpec
-from app.services.schema_evidence import capture_schema_evidence
-from app.services.validation import compute_bundle_hash, validate_reporting_procedure
+from app.contracts.reference import ReferenceBundle
+from app.contracts.schema import SchemaBinding
+from app.contracts.semantic import SemanticContract
+from app.contracts.validation import ProcedureCandidateV3, ValidationEvidence
+from app.db.sqlite import get_sps, get_v3_deployment_chain, update_sp
+from app.db.sqlserver import (
+    _deployable_code,
+    compile_candidate,
+    deploy_procedures_atomically,
+)
+from app.services.catalog_v3 import capture_catalog_snapshot
+from app.services.schema_binding_v3 import validate_binding_against_catalog
+from app.services.sql_renderer_v3 import SqlRendererV3
 from config import get_db_config, is_explicit_test_database
+
 
 router = APIRouter(prefix="/api/deploy", tags=["deploy"])
 
 
 def _readiness(session_id: str) -> tuple[bool, list[dict], list[dict]]:
     procedures = get_sps(session_id)
-    test_database_confirmed = is_explicit_test_database(get_db_config())
     results = []
     all_ready = bool(procedures)
-    evidence_cache = {}
+    test_database = is_explicit_test_database(get_db_config())
+
     for sp in procedures:
-        queries = get_verify_queries(sp["id"])
         reasons = []
-        revalidation_required = False
-        if not test_database_confirmed:
+        if not test_database:
             reasons.append("部署只允许在已明确配置的测试数据库执行")
-        syntax_ok, syntax_error = check_syntax(sp["code"])
-        current_hash = compute_bundle_hash(sp, queries)
-        if not syntax_ok:
-            reasons.append(syntax_error or "语法检查失败")
-        if not sp.get("business_valid"):
-            reasons.append("业务校验未通过")
-        if not sp.get("validated_hash") or sp.get("validated_hash") != current_hash:
-            reasons.append("当前内容与最近校验通过的版本不一致")
-        if not sp.get("bundle_hash") or sp.get("bundle_hash") != current_hash:
-            reasons.append("当前 bundle 与已审计哈希不一致")
-        query_spec_json = sp.get("query_spec_json")
-        schema_fingerprint = sp.get("schema_fingerprint")
-        if not query_spec_json or not schema_fingerprint:
-            reasons.append("缺少 QuerySpec 或 Schema 指纹，必须重新生成并校验")
-            revalidation_required = True
+        chain = (
+            get_v3_deployment_chain(session_id, sp.get("validated_hash"))
+            if sp.get("validated_hash") else None
+        )
+        if chain is None:
+            reasons.append("缺少完整 V3 冻结制品链或 validated 证据")
         else:
             try:
-                cache_key = json.dumps(
-                    json.loads(query_spec_json),
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
+                semantic = SemanticContract.model_validate(
+                    chain["semantic_contract"]
                 )
-                if cache_key not in evidence_cache:
-                    evidence_cache[cache_key] = capture_schema_evidence(
-                        QuerySpec.model_validate_json(cache_key),
+                binding = SchemaBinding.model_validate(chain["schema_binding"])
+                reference = ReferenceBundle.model_validate(
+                    chain["reference_bundle"]
+                )
+                candidate = ProcedureCandidateV3.model_validate(
+                    chain["procedure_candidate"]
+                )
+                evidence = ValidationEvidence.model_validate_json(
+                    json.dumps(
+                        chain["validation_evidence"], ensure_ascii=False
                     )
-                current_evidence = evidence_cache[cache_key]
-                if current_evidence.unresolved:
-                    reasons.append("目标 Schema 已无法绑定 QuerySpec 中的全部标识符")
-                    revalidation_required = True
-                elif current_evidence.fingerprint != schema_fingerprint:
-                    reasons.append("目标 Schema 已变化，必须重新校验")
-                    revalidation_required = True
+                )
+                catalog = capture_catalog_snapshot()
+                validate_binding_against_catalog(semantic, catalog, binding)
+                rendered = SqlRendererV3(
+                    semantic, binding
+                ).render_procedure(candidate.procedure_plan)
+                if rendered != candidate.procedure_sql or rendered != sp["code"]:
+                    reasons.append("待部署 SQL 与冻结 ProcedurePlan 不一致")
+                if candidate.content_hash != sp.get("validated_hash"):
+                    reasons.append("候选 hash 与 validated 版本不一致")
+                if (
+                    evidence.status != "validated"
+                    or evidence.candidate_hash != candidate.content_hash
+                    or evidence.reference_bundle_hash != reference.content_hash
+                    or not evidence.coverage
+                    or not evidence.coverage.effective
+                ):
+                    reasons.append("ValidationEvidence 未证明有效覆盖和完整通过")
+                parameters = json.loads(sp.get("parameters") or "[]")
+                compiled = compile_candidate(
+                    "procedure", sp["name"], sp["code"], parameters
+                )
+                if not compiled.get("ok"):
+                    reasons.append(
+                        str(compiled.get("error") or "SQL 编译检查失败")
+                    )
+                _deployable_code(sp["name"], sp["code"])
             except Exception as exc:
-                reasons.append(f"无法刷新目标 Schema 指纹: {exc}")
-                revalidation_required = True
-        try:
-            validate_reporting_procedure(
-                sp["code"], sp.get("operation_type") or "query", queries
-            )
-            _deployable_code(sp["name"], sp["code"])
-        except Exception as exc:
-            reasons.append(str(exc))
+                reasons.append(f"V3 部署证据检查失败: {exc}")
+
         ready = not reasons
         all_ready = all_ready and ready
-        results.append({
-            "sp_id": sp["id"], "name": sp["name"], "ready": ready,
-            "syntax_ok": syntax_ok, "reasons": reasons,
-            "error": "；".join(reasons),
-            "revalidation_required": revalidation_required,
-        })
+        results.append(
+            {
+                "sp_id": sp["id"],
+                "name": sp["name"],
+                "ready": ready,
+                "reasons": reasons,
+                "error": "；".join(reasons),
+                "revalidation_required": not ready,
+            }
+        )
     return all_ready, results, procedures
 
 
@@ -103,7 +123,9 @@ def api_deploy(session_id: str):
         deployed_at = datetime.datetime.now().isoformat()
         for sp in procedures:
             update_sp(
-                sp["id"], status="deployed", deployed_at=deployed_at,
+                sp["id"],
+                status="deployed",
+                deployed_at=deployed_at,
                 deployed_hash=sp["validated_hash"],
             )
     return {"ok": all_ok, "results": results}

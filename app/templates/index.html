@@ -473,6 +473,9 @@
                     }
                     return text;
                 }
+                if (obj.checkpoint_id && obj.selections) {
+                    return '✅ 已提交数据库字段选择';
+                }
             } catch(e) {}
         }
         return content;
@@ -554,7 +557,9 @@
                 try {
                     const data = JSON.parse(line.slice(6));
 
-                    if (data.type === 'done' || data.type === 'verify_result' || data.type === 'error') {
+                    if (data.type === 'done' || data.type === 'verify_result' ||
+                            data.type === 'error' || data.type === 'design_draft' ||
+                            data.type === 'semantic_design_error') {
                         terminalEventReceived = true;
                     }
 
@@ -591,6 +596,30 @@
                                 {label: '✅ 确认方案，开始生成', text: '确认，请开始生成存储过程', action: 'confirm_design', style: 'primary'},
                                 {label: '🔄 重新设计', text: '请重新设计方案', style: 'secondary'},
                             ]);
+                    } else if (data.type === 'schema_choice') {
+                        assistantText = data.content;
+                        assistantDiv.innerHTML = renderSchemaChoice(
+                            data.checkpoint_id,
+                            data.issues || []
+                        );
+                    } else if (data.type === 'design_revision') {
+                        assistantText = data.content;
+                        assistantDiv.innerHTML = renderDesignRevision(
+                            data.revision || {}
+                        );
+                    } else if (data.type === 'schema_issue') {
+                        assistantText = data.reason || data.business_impact || '';
+                        assistantDiv.className = 'message error';
+                        assistantDiv.innerHTML = renderSchemaIssue(data);
+                    } else if (data.type === 'semantic_design_error') {
+                        assistantText = data.message || '';
+                        assistantDiv.className = 'message error';
+                        assistantDiv.innerHTML = renderSemanticDesignError(data);
+                    } else if (data.type === 'design_draft') {
+                        assistantText = data.content;
+                        assistantDiv.innerHTML = '<div class="design-block"><div class="design-header">⚠️ 方案草稿（待修正）</div><div class="design-content">'
+                            + renderMarkdown(data.content)
+                            + '</div><div class="design-hint">当前草稿不能生成或部署 SQL，请回复修改意见后重试。</div></div>';
                     } else if (data.type === 'auto_fix_progress') {
                         assistantText = data.content;
                         assistantDiv.innerHTML = '<em style="color:#e67e22;">⏳ ' + escapeHtml(data.content) + '</em>';
@@ -601,7 +630,9 @@
                         assistantDiv.innerHTML = renderVerifyResult(data.content, data.data);
                         // 判断校验是否全部通过
                         const vResults = (data.data && data.data.verify_results) ? data.data.verify_results : [];
-                        const allPassed = vResults.length > 0 && vResults.every(vr => vr.syntax_ok && vr.business_ok);
+                        const allPassed = vResults.length > 0 && vResults.every(
+                            vr => vr.deployment_eligible === true
+                        );
                         const persisted = data.data && data.data.status === 'persisted';
                         const needsReview = data.data && data.data.status === 'needs_review';
                         if (persisted && allPassed) {
@@ -620,16 +651,16 @@
                                 {label: '🔄 重新生成', text: '请重新生成存储过程', style: 'secondary'},
                             ]);
                         }
-                        // 只有持久化成功后才同步右侧当前有效 SP。
+                        // 所有候选都会保存；失败状态只阻止部署，不阻止右侧编辑。
                         for (const vr of vResults) {
-                            if (!persisted || !vr.sp_id) continue;
+                            if (!vr.sp_id) continue;
                             lastVerifyResults[vr.sp_id] = vr;
                             refreshSpStatusInPlace(vr.sp_id, vr);
                             showSpVerifyResult(vr.sp_id, vr);
                         }
                     } else if (data.type === 'update') {
-                        // 候选生成和失败校验不会修改当前有效 SP。
-                        if (data.node === 'verify' && data.data && data.data.status === 'persisted') {
+                        if (data.node === 'verify' && data.data &&
+                                ['persisted', 'verify_failed', 'needs_review'].includes(data.data.status)) {
                             loadSpList();
                         }
                     } else if (data.type === 'done') {
@@ -849,6 +880,149 @@
         document.getElementById('chat-form').dispatchEvent(new Event('submit', {cancelable: true}));
     }
 
+    function renderSchemaChoice(checkpointId, issues) {
+        let html = '<div class="assumptions-block schema-choice-block">';
+        html += '<div class="assumptions-header">🔎 需要确认数据库字段</div>';
+        html += '<div class="assumptions-hint">系统没有猜测字段。请选择最符合业务口径的实现；选择结果只对当前数据库结构有效。</div>';
+        for (const issue of issues) {
+            html += `<div class="assumption-item schema-issue" data-issue-id="${escapeHtml(issue.issue_id)}">`;
+            html += `<div class="assumption-title">${escapeHtml(issue.business_meaning || '待确认业务字段')}</div>`;
+            html += `<div class="assumption-reason">${escapeHtml(issue.reason || '')}</div>`;
+            html += `<select class="schema-candidate-select">`;
+            html += '<option value="">请选择…</option>';
+            for (const candidate of (issue.physical_candidates || [])) {
+                const consequences = (candidate.consequences || []).join('；');
+                const label = consequences
+                    ? `${candidate.business_label}（${consequences}）`
+                    : candidate.business_label;
+                html += `<option value="${escapeHtml(candidate.candidate_id)}">${escapeHtml(label)}</option>`;
+            }
+            html += '</select></div>';
+        }
+        html += `<button class="quick-btn primary" onclick="submitSchemaChoice('${escapeHtml(checkpointId)}')">确认选择并继续</button>`;
+        html += '</div>';
+        return html;
+    }
+
+    function submitSchemaChoice(checkpointId) {
+        const selections = {};
+        const items = document.querySelectorAll('.schema-choice-block .schema-issue');
+        for (const item of items) {
+            const value = item.querySelector('.schema-candidate-select').value;
+            if (!value) {
+                alert('请完成全部数据库字段选择');
+                return;
+            }
+            selections[item.dataset.issueId] = value;
+        }
+        const input = document.getElementById('chat-input');
+        input.value = JSON.stringify({checkpoint_id: checkpointId, selections});
+        document.getElementById('chat-form').dispatchEvent(
+            new Event('submit', {cancelable: true})
+        );
+    }
+
+    function renderDesignRevision(revision) {
+        const changes = revision.changes || [];
+        let html = '<div class="design-block">';
+        html += '<div class="design-header">🧭 数据来源设计需要调整</div>';
+        html += `<div class="design-hint">${escapeHtml(revision.reason || '')}</div>`;
+        html += '<div class="design-content"><p>业务金额、币种、日期、输出和容差保持不变。建议只调整以下实现形状：</p><ul>';
+        for (const change of changes) {
+            html += `<li>${escapeHtml(change.path || '')}：根据真实 Schema 调整数据来源结构</li>`;
+        }
+        html += '</ul></div>';
+        html += renderQuickActions([
+            {
+                label: '✅ 确认数据来源修订',
+                text: '确认数据来源修订',
+                action: 'confirm_design_revision',
+                style: 'primary'
+            },
+            {
+                label: '↩️ 返回修改业务方案',
+                text: '不同意该修订，请返回业务设计',
+                style: 'secondary'
+            },
+        ]);
+        html += '</div>';
+        return html;
+    }
+
+    function renderSchemaIssue(issue) {
+        let html = '<div class="design-block">';
+        html += `<div class="design-header">⚠️ ${escapeHtml(issue.title || 'Schema 解析未通过')}</div>`;
+        html += `<div class="design-content"><p><strong>阶段：</strong>${escapeHtml(issue.stage || 'schema_resolution')}</p>`;
+        html += `<p><strong>错误码：</strong>${escapeHtml(issue.code || '')}</p>`;
+        html += `<p><strong>业务影响：</strong>${escapeHtml(issue.business_impact || '')}</p>`;
+        html += `<p><strong>原因：</strong>${escapeHtml(issue.reason || '')}</p>`;
+        html += `<p><strong>系统动作：</strong>${escapeHtml(issue.system_action || '')}</p>`;
+        html += `<p><strong>下一步：</strong>${escapeHtml(issue.user_action || '')}</p></div>`;
+        html += '</div>';
+        return html;
+    }
+
+    function renderSemanticDesignError(issue) {
+        const evidence = issue.evidence || {};
+        const stageLabels = {
+            semantic_obligations: '业务政策义务编译',
+            result_contract: '最终结果与粒度',
+            fact_blueprint: '业务事实拆分',
+            computation_blueprint: '业务计算蓝图',
+            semantic_inputs: '来源输入义务编译',
+            source_requirements: '底层业务字段需求',
+            expression_materialize: '确定性公式物化',
+            semantic_compile: '确定性语义编译'
+        };
+        const stage = issue.stage || 'semantic_compile';
+        let html = '<div class="design-block semantic-design-error">';
+        if (evidence.policy_value) {
+            html += `<p><strong>确认值：</strong>${escapeHtml(evidence.policy_value)}</p>`;
+        }
+        if (evidence.effect) {
+            html += `<p><strong>影响类型：</strong>${escapeHtml(evidence.effect)}</p>`;
+        }
+        if (evidence.kind || evidence.obligation_kind || evidence.actual_kind) {
+            html += `<p><strong>义务类型：</strong>${escapeHtml(evidence.kind || evidence.obligation_kind || evidence.actual_kind)}</p>`;
+        }
+        if (evidence.target) {
+            html += `<p><strong>目标：</strong>${escapeHtml(JSON.stringify(evidence.target))}</p>`;
+        }
+        if (evidence.formula) {
+            html += `<p><strong>冻结公式：</strong>${escapeHtml(JSON.stringify(evidence.formula))}</p>`;
+        }
+        if (evidence.required_inputs) {
+            html += `<p><strong>必需输入：</strong>${escapeHtml(JSON.stringify(evidence.required_inputs))}</p>`;
+        }
+        if (evidence.actual_inputs || evidence.implemented_inputs) {
+            html += `<p><strong>实际输入：</strong>${escapeHtml(JSON.stringify(evidence.actual_inputs || evidence.implemented_inputs))}</p>`;
+        }
+        if (evidence.missing) {
+            html += `<p><strong>缺失输入：</strong>${escapeHtml(JSON.stringify(evidence.missing))}</p>`;
+        }
+        if (evidence.extra || evidence.unused) {
+            html += `<p><strong>多余或未消费输入：</strong>${escapeHtml(JSON.stringify(evidence.extra || evidence.unused))}</p>`;
+        }
+        if (evidence.blocked_downstream) {
+            html += `<p><strong>已阻止后续阶段：</strong>${escapeHtml(JSON.stringify(evidence.blocked_downstream))}</p>`;
+        }
+        if (Object.keys(evidence).length) {
+            html += `<p><strong>证据：</strong>${escapeHtml(JSON.stringify(evidence))}</p>`;
+        }
+        html += '<div class="design-header">⚠️ 业务设计未通过</div>';
+        html += '<div class="design-content">';
+        html += `<p><strong>停止阶段：</strong>${escapeHtml(stageLabels[stage] || stage)}</p>`;
+        html += `<p><strong>错误码：</strong>${escapeHtml(issue.code || '')}</p>`;
+        if (issue.business_element) {
+            html += `<p><strong>涉及内容：</strong>${escapeHtml(issue.business_element)}</p>`;
+        }
+        html += `<p><strong>原因：</strong>${escapeHtml(issue.message || '')}</p>`;
+        html += `<p><strong>系统动作：</strong>${escapeHtml(issue.system_action || '')}</p>`;
+        html += `<p><strong>下一步：</strong>${escapeHtml(issue.user_action || '请补充或修正业务口径')}</p>`;
+        html += '</div></div>';
+        return html;
+    }
+
     function quickSend(btn, text, action = 'send') {
         // 移除所有快捷按钮（避免重复点击）
         const actionsDiv = btn.closest('.quick-actions');
@@ -866,6 +1040,158 @@
         deployAll();
     }
 
+    const validationStageLabels = {
+        environment: '环境',
+        semantic_contract: '业务合同',
+        schema_binding: 'Schema 绑定',
+        reference_plan: 'Reference 计划',
+        reference_compile: 'Reference 编译',
+        reference_preflight: 'Reference 预执行',
+        procedure_plan: 'SP 计划',
+        procedure_compile: 'SP 编译',
+        result_contract: '结果合同',
+        business_comparison: '业务对账',
+        evidence_integrity: '证据完整性',
+        schema: 'Schema',
+        safety: '安全',
+        compile: 'SQL 编译',
+        contract: '契约',
+        business: '业务',
+    };
+
+    function validationStageStatus(result, name) {
+        const stage = result && Array.isArray(result.stages)
+            ? result.stages.find(item => item.stage === name)
+            : result && result.stages && result.stages[name];
+        if (stage && ['running', 'passed', 'failed', 'not_run', 'inconclusive'].includes(stage.status)) {
+            return stage.status;
+        }
+        return 'not_run';
+    }
+
+    function validationStageIcon(status) {
+        return {
+            running: '⏳', passed: '✅', failed: '❌',
+            inconclusive: '⚠️', not_run: '⬜'
+        }[status] || '⬜';
+    }
+
+    function renderValidationStages(result, compact = false) {
+        const names = [
+            'environment', 'semantic_contract', 'schema_binding',
+            'reference_plan', 'reference_compile', 'reference_preflight',
+            'procedure_plan', 'procedure_compile', 'result_contract',
+            'business_comparison', 'evidence_integrity'
+        ];
+        return names.map(name => {
+            const status = validationStageStatus(result, name);
+            const label = validationStageLabels[name];
+            const text = compact ? `${label}:${validationStageIcon(status)}` : `${validationStageIcon(status)} ${label}`;
+            return `<span class="validation-stage ${status}" data-stage="${name}">${text}</span>`;
+        }).join('');
+    }
+
+    function renderV3Evidence(result) {
+        const statusInfo = {
+            validated: ['✅', '正确通过', 'passed'],
+            failed: ['❌', '未通过', 'failed'],
+            inconclusive: ['⚠️', '无法判定', 'inconclusive'],
+            needs_review: ['⚠️', '需要人工复核', 'inconclusive'],
+        }[result.status] || ['⬜', result.status || '未运行', 'not_run'];
+        let html = `<div class="v3-conclusion ${statusInfo[2]}">` +
+            `<strong>${statusInfo[0]} ${escapeHtml(statusInfo[1])}</strong>`;
+        if (result.coverage) {
+            html += `<span>覆盖：Reference ${result.coverage.expected_row_count} 行，` +
+                `SP ${result.coverage.actual_row_count} 行</span>`;
+        }
+        html += '</div>';
+        html += `<div class="spr-summary validation-stages">${renderValidationStages(result)}</div>`;
+
+        for (const repair of result.repair_events || []) {
+            html += `<details class="v3-repair-event"><summary>自动修复：${escapeHtml(repair.role)}（${escapeHtml(repair.status)}）</summary>`;
+            html += `<div>允许修改：${escapeHtml((repair.allowed_changes || []).join('、'))}</div>`;
+            html += `<div>冻结不变：${escapeHtml((repair.frozen || []).join('、'))}</div>`;
+            html += `<div>触发原因：${escapeHtml(repair.error || '')}</div>`;
+            if (repair.before || repair.after) {
+                html += `<pre>${escapeHtml(JSON.stringify({before: repair.before, after: repair.after}, null, 2))}</pre>`;
+            }
+            html += `</details>`;
+        }
+
+        const issues = (result.stages || []).flatMap(stage => stage.issues || []);
+        for (const item of issues) {
+            html += `<div class="v3-issue-card ${escapeHtml(item.status)}">`;
+            html += `<div class="v3-issue-title">${item.status === 'inconclusive' ? '⚠️' : '❌'} ` +
+                `${escapeHtml(item.title)} <code>${escapeHtml(item.code)}</code></div>`;
+            html += `<div class="v3-issue-summary">${escapeHtml(item.summary)}</div>`;
+            html += `<div class="v3-user-action">建议：${escapeHtml(item.user_action)}</div>`;
+            if (item.location) {
+                const locations = [
+                    item.location.contract_path && `契约：${item.location.contract_path}`,
+                    item.location.plan_path && `计划：${item.location.plan_path}`,
+                    item.location.sql_line && `SQL 第 ${item.location.sql_line} 行`,
+                ].filter(Boolean);
+                if (locations.length) {
+                    html += `<div class="v3-issue-location">定位：${escapeHtml(locations.join('；'))}</div>`;
+                }
+            }
+            html += `<div class="v3-repair-boundary">` +
+                (item.auto_fixable
+                    ? '允许自动修复：仅修改当前 ProcedurePlan；SemanticContract、SchemaBinding、ReferenceBundle 保持冻结。'
+                    : '不自动修复：需要按建议返回对应阶段处理，冻结事实不会被后台改写。') +
+                `</div>`;
+            if (item.evidence && Object.keys(item.evidence).length) {
+                html += `<details><summary>查看错误证据</summary><pre>${escapeHtml(JSON.stringify(item.evidence, null, 2))}</pre></details>`;
+            }
+            if (item.technical_detail) {
+                html += `<details><summary>技术详情</summary><pre>${escapeHtml(item.technical_detail)}</pre></details>`;
+            }
+            html += '</div>';
+        }
+
+        for (const comparison of result.comparisons || []) {
+            html += `<div class="v3-comparison ${comparison.match ? 'passed' : 'failed'}">`;
+            html += `<div><strong>${comparison.match ? '✅' : '❌'} ${escapeHtml(comparison.fact_id)}</strong> ` +
+                `${escapeHtml(comparison.summary)}</div>`;
+            const groups = [
+                ['缺少', 'missing', comparison.missing],
+                ['多出', 'extra', comparison.extra],
+                ['重复键', 'duplicate_keys', comparison.duplicate_keys],
+                ['字段差异', 'differences', comparison.differences],
+            ];
+            for (const [label, key, rows] of groups) {
+                if (!rows || !rows.length) continue;
+                const total = (comparison.difference_totals || {})[key] || rows.length;
+                const pageSize = 20;
+                const pageCount = Math.ceil(rows.length / pageSize);
+                const pagerId = `v3diff_${Math.random().toString(36).slice(2)}`;
+                html += `<details><summary>${label}（共 ${total}，展示 ${rows.length}）</summary>`;
+                for (let page = 0; page < pageCount; page++) {
+                    html += `<pre id="${pagerId}_${page}" class="v3-diff-page" ` +
+                        `${page ? 'style="display:none"' : ''}>` +
+                        `${escapeHtml(JSON.stringify(rows.slice(page * pageSize, (page + 1) * pageSize), null, 2))}</pre>`;
+                }
+                if (pageCount > 1) {
+                    html += `<div class="v3-diff-pager" data-page-count="${pageCount}">`;
+                    for (let page = 0; page < pageCount; page++) {
+                        html += `<button type="button" onclick="showV3DiffPage('${pagerId}', ${page}, ${pageCount})">${page + 1}</button>`;
+                    }
+                    html += `</div>`;
+                }
+                html += `</details>`;
+            }
+            html += '</div>';
+        }
+        return html;
+    }
+
+    function showV3DiffPage(id, selected, pageCount) {
+        for (let page = 0; page < pageCount; page++) {
+            const element = document.getElementById(`${id}_${page}`);
+            if (element) element.style.display = page === selected ? '' : 'none';
+        }
+    }
+
     function renderVerifyResult(text, nodeData) {
         // 使用结构化数据渲染校验结果
         let html = '<strong>🔍 校验结果</strong>';
@@ -873,18 +1199,19 @@
         if (vResults.length > 0) {
             for (const vr of vResults) {
                 const spName = escapeHtml(vr.sp_name || vr.sp_id || '?');
-                const synIcon = vr.syntax_ok ? '✅' : '❌';
-                const hasConfigError = (vr.details || []).some(d => d.type === 'configuration');
-                const bizIcon = hasConfigError ? '⚠️' : (vr.business_ok ? '✅' : '❌');
-                const bizLabel = hasConfigError ? '业务未判定（配置错误）' : '业务';
                 html += `<div class="verify-chat-card">`;
                 html += `<div class="verify-chat-title">📄 ${spName}</div>`;
-                html += `<div class="verify-chat-summary">${synIcon} 语法 &nbsp; ${bizIcon} ${bizLabel}</div>`;
+                if (vr.version === 3 && Array.isArray(vr.stages)) {
+                    html += renderV3Evidence(vr);
+                    html += '</div>';
+                    continue;
+                }
+                html += `<div class="verify-chat-summary validation-stages">${renderValidationStages(vr)}</div>`;
                 if (vr.details && vr.details.length > 0) {
                     html += '<div class="verify-chat-details">';
                     for (const d of vr.details) {
-                        if (d.type === 'syntax' && !d.pass) {
-                            html += `<div class="vcd-row fail">❌ 语法错误: ${escapeHtml((d.error||'').substring(0,150))}</div>`;
+                        if (d.type === 'compile' && !d.pass) {
+                            html += `<div class="vcd-row fail">❌ SQL 编译错误: ${escapeHtml((d.error||'').substring(0,150))}</div>`;
                         } else if (d.type === 'business') {
                             const mark = d.pass ? '✅' : '❌';
                             const summary = d.comparison && d.comparison.summary;
@@ -892,7 +1219,10 @@
                             html += `<div class="vcd-row ${d.pass?'pass':'fail'}">${mark} ${escapeHtml(d.query||'')}: ${detail}</div>`;
                         } else if (!d.pass && d.error) {
                             const labels = {
-                                safety: '安全检查', execution: '执行错误', rollback: '回滚检查', configuration: '校验配置错误',
+                                query_spec: '方案契约错误', schema: 'Schema 错误',
+                                safety: '安全检查', contract: '契约一致性错误',
+                                execution: '执行错误', rollback: '回滚检查',
+                                configuration: '校验配置错误',
                             };
                             const label = labels[d.type] || '校验错误';
                             html += `<div class="vcd-row fail">❌ ${label}: ${escapeHtml(String(d.error).substring(0,200))}</div>`;
@@ -929,15 +1259,17 @@
         let html = '';
         for (const sp of spData.procedures) {
             spCache[sp.id] = sp;
-            const statusLabel = {draft:'草稿', verified:'已校验', persisted:'已校验并保存', verify_failed:'校验失败', deployed:'已部署'}[sp.status] || sp.status;
+            const statusLabel = {draft:'草稿', verified:'已校验', persisted:'已校验并保存', verify_failed:'校验失败', needs_review:'待复核', deployed:'已部署'}[sp.status] || sp.status;
             const statusCls = sp.status || 'draft';
-            const synIcon = sp.syntax_valid ? '✅' : (sp.syntax_valid === 0 ? '❌' : '⬜');
-            const bizIcon = sp.business_valid ? '✅' : (sp.business_valid === 0 ? '❌' : '⬜');
+            let savedValidation = {version: 3, stages: []};
+            try {
+                savedValidation = {...savedValidation, ...JSON.parse(sp.verify_result || '{}')};
+            } catch(e) {}
+            const isV3 = savedValidation.version === 3;
+            spCache[sp.id]._isV3 = isV3;
 
-            // 获取该校验 SQL
-            const vR = await fetch(`/api/verify/${currentSessionId}/sp/${sp.id}`);
-            const vData = await vR.json();
-            const vqs = vData.verify_queries || [];
+            // V3 的 ReferenceBundle 是冻结制品，不通过旧校验 SQL 编辑接口读取。
+            const vqs = [];
             verifyQueryCache[sp.id] = vqs;
 
             html += `
@@ -945,9 +1277,8 @@
                 <div class="sp-group-header" onclick="toggleSpGroup('sp-group-${sp.id}')">
                     <span class="toggle-arrow" id="arrow-${sp.id}">▸</span>
                     <span class="sp-group-name">📄 ${escapeHtml(sp.name)}</span>
-                    <span class="sp-group-badges">
-                        <span>语法:${synIcon}</span>
-                        <span>业务:${bizIcon}</span>
+                    <span class="sp-group-badges validation-stages">
+                        ${renderValidationStages(savedValidation, true)}
                     </span>
                     <span class="sp-status ${statusCls}">${statusLabel}</span>
                 </div>
@@ -955,7 +1286,7 @@
                     <div class="sp-code-section">
                         <div class="sp-code-header" onclick="toggleSpCode('sp-code-body-${sp.id}')">
                             <span class="toggle-arrow" id="sp-code-arrow-${sp.id}">▸</span>
-                            <span>📝 SQL 代码</span>
+                            <span>${isV3 ? '🔒 SQL 代码（由冻结计划生成）' : '📝 SQL 代码'}</span>
                         </div>
                         <div class="sp-code-body collapsed" id="sp-code-body-${sp.id}">
                             <textarea id="sp-editor-${sp.id}" class="sp-code-editor">${escapeHtml(sp.code)}</textarea>
@@ -990,10 +1321,12 @@
                     <div class="verify-inline">
                         <div class="verify-inline-header" onclick="toggleVerifyBlock('vq-block-${sp.id}')">
                             <span class="toggle-arrow" id="vq-arrow-${sp.id}">▸</span>
-                            <span>📋 校验 SQL（${vqs.length} 条）</span>
+                            <span>${isV3 ? '🔒 独立 Reference（已冻结）' : `📋 校验 SQL（${vqs.length} 条）`}</span>
                         </div>
                         <div class="verify-inline-body collapsed" id="vq-block-${sp.id}">
-                            ${vqs.length === 0 ? '<p class="empty-hint">暂无校验 SQL</p>' : vqs.map(vq => {
+                            ${isV3
+                                ? '<p class="empty-hint">Reference 定义已独立编译和预执行。为避免相互迎合，此处不允许手工改写；详细证据见下方校验结果。</p>'
+                                : (vqs.length === 0 ? '<p class="empty-hint">暂无校验 SQL</p>' : vqs.map(vq => {
                                 const passIcon = vq.status === 'pass' ? '✅' : (vq.status === 'fail' ? '❌' : '⬜');
                                 const statusCls = vq.status || 'pending';
                                 return `
@@ -1010,12 +1343,14 @@
                                     </div>
                                     <div id="vq-result-${vq.id}">${vq.result_detail ? `<pre class="vq-result-detail">${escapeHtml(vq.result_detail)}</pre>` : ''}</div>
                                 </div>`;
-                            }).join('')}
+                            }).join(''))}
                         </div>
                     </div>
                     <div class="sp-actions">
-                        <button class="verify-btn" onclick="verifySp('${sp.id}')">🔍 校验</button>
-                        <button class="save-verify-btn" onclick="saveAndVerifySp('${sp.id}')">💾 校验+保存</button>
+                        ${isV3
+                            ? '<span class="v3-locked-hint">修改业务逻辑请重新生成，不能直接改 SQL 后沿用旧证据。</span>'
+                            : `<button class="verify-btn" onclick="verifySp('${sp.id}')">🔍 校验</button>
+                               <button class="save-verify-btn" onclick="saveAndVerifySp('${sp.id}')">💾 校验+保存</button>`}
                         <button class="execute-btn" onclick="executeSp('${sp.id}')">▶️ 执行</button>
                         <span class="sp-action-status" id="sp-action-status-${sp.id}"></span>
                     </div>
@@ -1038,7 +1373,7 @@
             for (const sp of spData.procedures) {
                 const codeBody = document.getElementById('sp-code-body-' + sp.id);
                 if (codeBody && !codeBody.classList.contains('collapsed')) {
-                    initCodeMirror(`sp-editor-${sp.id}`, false);
+                    initCodeMirror(`sp-editor-${sp.id}`, Boolean(spCache[sp.id] && spCache[sp.id]._isV3));
                 }
             }
         }, 100);
@@ -1050,6 +1385,11 @@
                 if (cached) {
                     refreshSpStatusInPlace(sp.id, cached);
                     showSpVerifyResult(sp.id, cached);
+                } else {
+                    try {
+                        const saved = JSON.parse(sp.verify_result || '{}');
+                        if (saved.version === 3) showSpVerifyResult(sp.id, saved);
+                    } catch(e) {}
                 }
             }
         }, 200);
@@ -1087,7 +1427,7 @@
                 if (cm) {
                     cm.refresh();
                 } else {
-                    initCodeMirror(key, false);
+                    initCodeMirror(key, Boolean(spCache[spId] && spCache[spId]._isV3));
                 }
             }, 100);
         }
@@ -1131,7 +1471,7 @@
         const params = {};
         const inputs = document.querySelectorAll(`[id^="param-${spId}-"]`);
         for (const inp of inputs) {
-            const name = inp.id.replace(`param-${spId}-`, '');
+            const name = inp.id.replace(`param-${spId}-`, '').replace(/^@/, '');
             if (inp.value.trim()) {
                 params[name] = inp.value.trim();
             }
@@ -1365,16 +1705,14 @@
         statusEl.className = 'sp-action-status running';
 
         try {
-            const r = await fetch(`/api/verify/sp/${spId}`, {
+            const r = await fetch(`/api/v3/revalidate/sp/${spId}`, {
                 method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify(verifyRequestBody(spId, false)),
             });
             const data = await r.json();
             if (data.ok) {
                 refreshSpStatusInPlace(spId, data.result);
                 showSpVerifyResult(spId, data.result);
-                const allPass = data.result && data.result.syntax_ok && data.result.business_ok;
+                const allPass = data.result && data.result.deployment_eligible === true;
                 if (allPass) {
                     statusEl.textContent = data.result.unsaved
                         ? '⚠️ 校验通过，但尚未保存，不可部署'
@@ -1401,17 +1739,14 @@
         statusEl.className = 'sp-action-status running';
 
         try {
-            // 后端在一个 SQLite 事务中保存 SP、校验 SQL和规格，然后执行完整校验。
-            const r = await fetch(`/api/verify/sp/${spId}`, {
+            const r = await fetch(`/api/v3/revalidate/sp/${spId}`, {
                 method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify(verifyRequestBody(spId, true)),
             });
             const data = await r.json();
             if (data.ok) {
                 refreshSpStatusInPlace(spId, data.result);
                 showSpVerifyResult(spId, data.result);
-                const allPass = data.result && data.result.syntax_ok && data.result.business_ok;
+                const allPass = data.result && data.result.deployment_eligible === true;
                 if (allPass) {
                     statusEl.textContent = '✅ 保存并校验完成';
                     statusEl.className = 'sp-action-status success';
@@ -1439,22 +1774,22 @@
         // 更新状态标签
         const statusEl = spGroup.querySelector('.sp-status');
         if (statusEl) {
-            const allOk = result.syntax_ok && result.business_ok;
-            const status = result.status || (allOk ? 'verified' : 'verify_failed');
+            const allOk = result.deployment_eligible === true;
+            const status = result.status === 'validated'
+                ? 'verified'
+                : (result.status || (allOk ? 'verified' : 'verify_failed'));
             const labels = {
                 draft: '草稿', verified: '已校验', persisted: '已校验并保存',
-                verify_failed: '校验失败', deployed: '已部署',
+                verify_failed: '校验失败', needs_review: '待复核', deployed: '已部署',
             };
             statusEl.textContent = labels[status] || status;
             statusEl.className = 'sp-status ' + status;
         }
 
-        // 更新语法/业务图标
-        const badges = spGroup.querySelectorAll('.sp-group-badges span');
-        if (badges.length >= 2) {
-            const hasConfigError = (result.details || []).some(d => d.type === 'configuration');
-            badges[0].textContent = '语法:' + (result.syntax_ok ? '✅' : '❌');
-            badges[1].textContent = '业务:' + (hasConfigError ? '⚠️' : (result.business_ok ? '✅' : '❌'));
+        // 更新各阶段三态图标
+        const badges = spGroup.querySelector('.sp-group-badges');
+        if (badges) {
+            badges.innerHTML = renderValidationStages(result, true);
         }
 
         // 更新校验 SQL 状态（遍历 details 中的 business 项）
@@ -1503,11 +1838,12 @@
         const container = document.getElementById('sp-verify-result-' + spId);
         if (!container) return;
 
-        const synIcon = result.syntax_ok ? '✅' : '❌';
-        const hasConfigError = (result.details || []).some(d => d.type === 'configuration');
-        const bizIcon = hasConfigError ? '⚠️' : (result.business_ok ? '✅' : '❌');
-        const bizLabel = hasConfigError ? '业务未判定（配置错误）' : '业务';
-        let html = `<div class="spr-summary">${synIcon} 语法 &nbsp; ${bizIcon} ${bizLabel}</div>`;
+        if (result && result.version === 3 && Array.isArray(result.stages)) {
+            container.innerHTML = renderV3Evidence(result);
+            container.style.display = 'block';
+            return;
+        }
+        let html = `<div class="spr-summary validation-stages">${renderValidationStages(result)}</div>`;
         if (result.unsaved) {
             html += '<div class="spr-row fail">⚠️ 当前编辑内容尚未保存，本次结果不能用于部署</div>';
         }
@@ -1515,8 +1851,8 @@
         if (result.details && result.details.length > 0) {
             html += '<div class="spr-details">';
             for (const d of result.details) {
-                if (d.type === 'syntax' && !d.pass) {
-                    html += `<div class="spr-row fail">❌ 语法错误: ${escapeHtml((d.error||'').substring(0,200))}</div>`;
+                if (d.type === 'compile' && !d.pass) {
+                    html += `<div class="spr-row fail">❌ SQL 编译错误: ${escapeHtml((d.error||'').substring(0,200))}</div>`;
                 } else if (d.type === 'business') {
                     const mark = d.pass ? '✅' : '❌';
                     let detail = '';
@@ -1542,7 +1878,10 @@
                     html += `<div class="spr-row ${d.pass?'pass':'fail'}">${mark} ${escapeHtml(d.query||'')}: ${detail}</div>`;
                 } else if (!d.pass && d.error) {
                     const labels = {
-                        safety: '安全检查', execution: '执行错误', rollback: '回滚检查', configuration: '校验配置错误',
+                        query_spec: '方案契约错误', schema: 'Schema 错误',
+                        safety: '安全检查', contract: '契约一致性错误',
+                        execution: '执行错误', rollback: '回滚检查',
+                        configuration: '校验配置错误',
                     };
                     const label = labels[d.type] || '校验错误';
                     html += `<div class="spr-row fail">❌ ${label}: ${escapeHtml(String(d.error).substring(0,300))}</div>`;
@@ -1585,8 +1924,8 @@
     // ====== 工具函数 ======
 
     function escapeHtml(s) {
-        if (!s) return '';
-        return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        if (s === null || s === undefined) return '';
+        return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
     }
 
     function initCodeMirror(textareaId, readOnly) {

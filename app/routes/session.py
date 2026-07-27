@@ -1,7 +1,10 @@
 """会话管理 API — 新建、列表、删除。"""
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from app.db.sqlite import create_session, get_sessions, delete_session, get_messages
+from app.db.sqlite import (
+    create_session, get_sessions, delete_session, get_messages,
+    get_session_design,
+)
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
 
@@ -30,3 +33,8 @@ def api_delete_session(session_id: str):
 @router.get("/{session_id}/messages")
 def api_get_messages(session_id: str):
     return {"messages": get_messages(session_id)}
+
+
+@router.get("/{session_id}/design")
+def api_get_design(session_id: str):
+    return {"design": get_session_design(session_id)}

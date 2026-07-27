@@ -6,10 +6,10 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from app.db.sqlite import (
-    delete_sp, get_sp, get_sps, get_verify_queries, update_sp,
+    delete_sp, get_sp, get_sps, get_v3_deployment_chain,
+    update_sp,
 )
 from app.db.sqlserver import _serialize_value, get_connection
-from app.services.validation import compute_bundle_hash
 from config import get_db_config, is_explicit_test_database
 
 router = APIRouter(prefix="/api/sp", tags=["stored_procedures"])
@@ -26,6 +26,15 @@ class ExecuteSpRequest(BaseModel):
     confirm_write: bool = False
 
 
+def _is_v3_sp(sp: dict) -> bool:
+    try:
+        return json.loads(sp.get("verification_plan_json") or "{}").get(
+            "version"
+        ) == 3
+    except (TypeError, json.JSONDecodeError):
+        return False
+
+
 @router.get("/{session_id}")
 def api_get_sps(session_id: str):
     return {"procedures": get_sps(session_id)}
@@ -33,15 +42,13 @@ def api_get_sps(session_id: str):
 
 @router.put("/{sp_id}")
 def api_update_sp(sp_id: str, req: UpdateSpRequest):
-    changes = {key: value for key, value in req.model_dump().items() if value is not None}
-    if not changes:
-        raise HTTPException(400, "没有可更新的字段")
-    changes.update(
-        status="draft", syntax_valid=0, business_valid=0,
-        validated_hash=None, bundle_hash=None, verify_result=None,
+    stored = get_sp(sp_id)
+    if not stored:
+        raise HTTPException(404, "存储过程不存在")
+    raise HTTPException(
+        409,
+        "V3 SQL 由冻结关系计划确定性生成；修改业务逻辑请返回方案重新生成。",
     )
-    update_sp(sp_id, **changes)
-    return {"ok": True}
 
 
 @router.delete("/{sp_id}")
@@ -85,9 +92,25 @@ def api_execute_sp(sp_id: str, req: ExecuteSpRequest):
     sp = get_sp(sp_id)
     if not sp:
         raise HTTPException(404, "存储过程不存在")
-    current_hash = compute_bundle_hash(sp, get_verify_queries(sp_id))
-    if (not sp.get("deployed_hash") or not sp.get("deployed_at")
-            or sp["deployed_hash"] != current_hash):
+    if _is_v3_sp(sp):
+        chain = (
+            get_v3_deployment_chain(
+                sp["session_id"],
+                sp.get("deployed_hash"),
+            )
+            if sp.get("deployed_hash") else None
+        )
+        deployed = bool(
+            chain
+            and sp.get("deployed_at")
+            and chain["procedure_candidate"].get("procedure_sql") == sp["code"]
+        )
+    else:
+        return {
+            "ok": False,
+            "error": "旧协议记录不可执行，请从 SemanticDesign V3 重新生成。",
+        }
+    if not deployed:
         return {
             "ok": False,
             "error": f"存储过程 [{sp['name']}] 尚未由本系统部署，请先点击一键部署。",

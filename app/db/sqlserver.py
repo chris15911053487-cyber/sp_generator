@@ -2,8 +2,13 @@
 import decimal
 import datetime
 import re
-import uuid
 import pyodbc
+from app.services.sql_artifact_compiler import (
+    SqlArtifactError,
+    describe_parameter_declaration,
+    extract_procedure_body,
+    find_sql_keyword,
+)
 from config import get_db_config
 
 
@@ -22,8 +27,19 @@ def _serialize_value(val):
 
 def _build_conn_str() -> str:
     cfg = get_db_config()
+    installed_drivers = set(pyodbc.drivers())
+    driver = next(
+        (
+            name for name in (
+                "ODBC Driver 18 for SQL Server",
+                "ODBC Driver 17 for SQL Server",
+            )
+            if name in installed_drivers
+        ),
+        "ODBC Driver 18 for SQL Server",
+    )
     return (
-        f"DRIVER={{ODBC Driver 18 for SQL Server}};"
+        f"DRIVER={{{driver}}};"
         f"SERVER={cfg['server']},{cfg['port']};"
         f"DATABASE={cfg['database']};"
         f"UID={cfg['user']};"
@@ -51,49 +67,38 @@ def execute_query(sql: str) -> list[dict]:
 
 
 def check_syntax(sql: str) -> tuple[bool, str]:
-    """检查 SQL 语法；存储过程还会创建本地临时过程以绑定真实对象。
+    """Check syntax and bind procedure bodies in the target DB context."""
+    procedure_match = re.match(
+        r'(?is)^\s*(?:CREATE\s+OR\s+ALTER|CREATE|ALTER)\s+'
+        r'PROC(?:EDURE)?\s+'
+        r'((?:\[[^\]]+\]|[A-Za-z_][\w$#]*)(?:\.'
+        r'(?:\[[^\]]+\]|[A-Za-z_][\w$#]*))?)',
+        sql,
+    )
+    if procedure_match:
+        name = procedure_match.group(1).replace("[", "").replace("]", "")
+        body_index = find_sql_keyword(sql, "AS")
+        if body_index is None:
+            return False, "存储过程定义缺少 AS 主体"
+        header = sql[procedure_match.end():body_index]
+        parameter_defs = [
+            {"name": match.group(1), "type": match.group(2)}
+            for match in re.finditer(
+                r"(?is)(@[A-Za-z_][A-Za-z0-9_]*)\s+"
+                r"([A-Za-z_][A-Za-z0-9_]*"
+                r"(?:\(\s*(?:MAX|\d+)(?:\s*,\s*\d+)?\s*\))?)",
+                header,
+            )
+        ]
+        result = compile_candidate("procedure", name, sql, parameter_defs)
+        return bool(result.get("ok")), str(result.get("error") or "")
 
-    对 ALTER PROCEDURE 做兼容处理：如果 SP 在服务器上不存在，
-    临时将 ALTER 转为 CREATE 来做语法检查。临时过程随连接关闭自动删除，
-    不会执行过程主体，也不会在业务库留下对象。
-    """
     conn = get_connection()
     cursor = conn.cursor()
-
-    # 判断是否是 ALTER PROCEDURE，如果是且 SP 不存在则转为 CREATE 检查语法
-    sql_to_check = sql
-    sql_stripped = sql.strip().upper()
-    if sql_stripped.startswith("ALTER") and ("PROC" in sql_stripped[:50]):
-        # 提取 SP 名称并检查是否存在
-        m = re.match(r'(?i)^\s*ALTER\s+PROC(?:EDURE)?\s+(?:\[?(\w+)\]?\.)?(\[?\w+\]?)', sql)
-        if m:
-            sp_name = m.group(2).strip("[]") if m.group(2) else ""
-            if sp_name:
-                try:
-                    cursor.execute("SELECT 1 FROM sys.procedures WHERE name = ?", (sp_name,))
-                    if cursor.fetchone() is None:
-                        # SP 不存在，临时转为 CREATE 来做语法检查
-                        sql_to_check = re.sub(r'(?i)^\s*ALTER\s+PROC(EDURE)?', 'CREATE PROCEDURE', sql, count=1)
-                except Exception:
-                    pass
-
     try:
         cursor.execute("SET PARSEONLY ON")
-        cursor.execute(sql_to_check)
+        cursor.execute(sql)
         cursor.execute("SET PARSEONLY OFF")
-        if re.match(
-            r'(?is)^\s*(?:CREATE\s+OR\s+ALTER|CREATE|ALTER)\s+PROC(?:EDURE)?\b',
-            sql_to_check,
-        ):
-            temp_name = "#compile_" + uuid.uuid4().hex[:16]
-            compile_code = re.sub(
-                r'(?is)^\s*(?:CREATE\s+OR\s+ALTER|CREATE|ALTER)\s+PROC(?:EDURE)?\s+'
-                r'(?:\[[^\]]+\]|[A-Za-z_][\w$#]*)(?:\.(?:\[[^\]]+\]|[A-Za-z_][\w$#]*))?',
-                f"CREATE PROCEDURE {temp_name}",
-                sql_to_check,
-                count=1,
-            )
-            cursor.execute(compile_code)
         conn.close()
         return True, ""
     except Exception as e:
@@ -161,33 +166,26 @@ def _described_columns(rows) -> list[dict]:
 def describe_query_references(
     sql: str,
     parameter_defs: list[dict] | None = None,
+    *,
+    allow_local_variables: bool = False,
 ) -> dict:
     """用 sp_describe_first_result_set 静态绑定查询并返回结果元数据。"""
-    parameter_defs = parameter_defs or []
-    definitions = {
-        str(item.get("name", "")).lstrip("@").lower(): item
-        for item in parameter_defs
-        if isinstance(item, dict) and item.get("name")
-    }
-    placeholders = []
-
-    def replace_placeholder(match: re.Match) -> str:
-        name = match.group(1)
-        if name.lower() not in {item.lower() for item in placeholders}:
-            placeholders.append(name)
-        return f"@{name}"
-
-    statement = re.sub(r"\{(\w+)\}", replace_placeholder, sql)
-    declarations = []
-    for name in placeholders:
-        item = definitions.get(name.lower(), {})
-        data_type = str(item.get("type", "NVARCHAR(MAX)")).strip().upper()
-        if not re.fullmatch(
-            r"[A-Z][A-Z0-9_]*(?:\((?:MAX|\d+)(?:\s*,\s*\d+)?\))?",
-            data_type,
-        ):
-            data_type = "NVARCHAR(MAX)"
-        declarations.append(f"@{name} {data_type}")
+    try:
+        statement, declarations, manifest = describe_parameter_declaration(
+            sql,
+            parameter_defs,
+            allow_undeclared=allow_local_variables,
+        )
+    except SqlArtifactError as exc:
+        return {
+            "ok": False,
+            "error": str(exc),
+            "code": exc.code,
+            "executed": False,
+            "method": "parameter_contract",
+            "result_columns": [],
+            "parameter_manifest": [],
+        }
 
     conn = None
     try:
@@ -197,7 +195,7 @@ def describe_query_references(
             "EXEC sys.sp_describe_first_result_set "
             "@tsql = ?, @params = ?, @browse_information_mode = 0",
             statement,
-            ", ".join(declarations) if declarations else None,
+            declarations,
         )
         return {
             "ok": True,
@@ -206,6 +204,7 @@ def describe_query_references(
             "executed": False,
             "method": "sp_describe_first_result_set",
             "result_columns": _described_columns(cursor.fetchall()),
+            "parameter_manifest": manifest,
         }
     except Exception as exc:
         return {
@@ -215,6 +214,7 @@ def describe_query_references(
             "executed": False,
             "method": "sp_describe_first_result_set",
             "result_columns": [],
+            "parameter_manifest": manifest,
         }
     finally:
         if conn is not None:
@@ -239,7 +239,7 @@ def compile_candidate(artifact: str, name: str, sql: str,
                       parameter_defs: list[dict] | None = None) -> dict:
     """静态编译候选，不执行过程主体或 Oracle 查询。"""
     parameter_defs = parameter_defs or []
-    if artifact == "oracle":
+    if artifact in {"oracle", "reference"}:
         return describe_query_references(sql, parameter_defs)
     if artifact != "procedure":
         return {
@@ -257,79 +257,27 @@ def compile_candidate(artifact: str, name: str, sql: str,
             "executed": False,
         }
 
-    temp_name = "#compile_" + uuid.uuid4().hex[:16]
-    compile_code = re.sub(
-        r'(?is)^\s*(?:CREATE\s+OR\s+ALTER|CREATE|ALTER)\s+PROC(?:EDURE)?\s+'
-        r'(?:\[[^\]]+\]|[A-Za-z_][\w$#]*)(?:\.(?:\[[^\]]+\]|[A-Za-z_][\w$#]*))?',
-        f"CREATE PROCEDURE {temp_name}",
-        prepared,
-        count=1,
-    )
-    arguments = []
-    for item in parameter_defs:
-        parameter = str(item.get("name") or "").strip()
-        if not re.fullmatch(r"@[A-Za-z_][A-Za-z0-9_]*", parameter):
-            return {
-                "ok": False,
-                "error": f"非法参数名: {parameter}",
-                "code": "invalid_parameter",
-                "executed": False,
-            }
-        arguments.append(f"{parameter} = NULL")
-    execute_statement = f"EXEC {temp_name}"
-    if arguments:
-        execute_statement += " " + ", ".join(arguments)
-
-    conn = None
-    showplan_on = False
     try:
-        conn = get_connection(autocommit=True)
-        cursor = conn.cursor()
-        cursor.execute(compile_code)
-        cursor.execute("SET SHOWPLAN_XML ON")
-        showplan_on = True
-        cursor.execute(execute_statement)
-        if cursor.description:
-            cursor.fetchall()
-        cursor.execute("SET SHOWPLAN_XML OFF")
-        showplan_on = False
-        cursor.execute(
-            "EXEC sys.sp_describe_first_result_set "
-            "@tsql = ?, @params = NULL, @browse_information_mode = 0",
-            execute_statement,
-        )
-        result_columns = _described_columns(cursor.fetchall())
-        cursor.execute(f"DROP PROCEDURE {temp_name}")
-        return {
-            "ok": True,
-            "error": "",
-            "code": "",
-            "executed": False,
-            "method": "temporary_procedure_showplan_xml",
-            "result_columns": result_columns,
-        }
-    except Exception as exc:
+        body = extract_procedure_body(prepared)
+    except SqlArtifactError as exc:
         return {
             "ok": False,
             "error": str(exc),
-            "code": _sql_error_code(exc),
+            "code": exc.code,
             "executed": False,
-            "method": "temporary_procedure_showplan_xml",
             "result_columns": [],
         }
-    finally:
-        if conn is not None:
-            cursor = conn.cursor()
-            if showplan_on:
-                try:
-                    cursor.execute("SET SHOWPLAN_XML OFF")
-                except Exception:
-                    pass
-            try:
-                cursor.execute(f"DROP PROCEDURE {temp_name}")
-            except Exception:
-                pass
-            conn.close()
+    result = describe_query_references(
+        body,
+        parameter_defs,
+        allow_local_variables=True,
+    )
+    result["method"] = (
+        "procedure_body_sp_describe"
+        if result.get("method") == "sp_describe_first_result_set"
+        else result.get("method")
+    )
+    return result
 
 
 
@@ -392,9 +340,31 @@ def read_schema_objects(object_refs: list[tuple[str, str]]) -> dict:
     conn = get_connection()
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT DB_NAME()")
+        cursor.execute("""
+            SELECT DB_NAME(),
+                SCHEMA_NAME(),
+                CONVERT(sysname, DATABASEPROPERTYEX(DB_NAME(), 'Collation')),
+                compatibility_level
+            FROM sys.databases
+            WHERE name = DB_NAME()
+        """)
         database_row = cursor.fetchone()
         database_name = str(database_row[0]) if database_row else ""
+        default_schema = (
+            str(database_row[1])
+            if database_row and len(database_row) > 1 and database_row[1]
+            else "dbo"
+        )
+        database_collation = (
+            str(database_row[2])
+            if database_row and len(database_row) > 2 and database_row[2]
+            else ""
+        )
+        compatibility_level = (
+            int(database_row[3])
+            if database_row and len(database_row) > 3 and database_row[3]
+            else 0
+        )
 
         cursor.execute("""
             SELECT s.name, o.name, o.object_id, o.type
@@ -416,6 +386,9 @@ def read_schema_objects(object_refs: list[tuple[str, str]]) -> dict:
         if not selected:
             return {
                 "database_name": database_name,
+                "database_collation": database_collation,
+                "compatibility_level": compatibility_level,
+                "default_schema": default_schema,
                 "objects": [],
                 "available_objects": available_objects,
             }
@@ -432,6 +405,7 @@ def read_schema_objects(object_refs: list[tuple[str, str]]) -> dict:
                 c.precision,
                 c.scale,
                 c.is_nullable,
+                c.collation_name,
                 CONVERT(nvarchar(4000), ep.value)
             FROM sys.objects o
             JOIN sys.schemas s ON s.schema_id = o.schema_id
@@ -456,7 +430,8 @@ def read_schema_objects(object_refs: list[tuple[str, str]]) -> dict:
                 "precision": row[5],
                 "scale": row[6],
                 "nullable": bool(row[7]),
-                "description": str(row[8]) if row[8] is not None else None,
+                "collation_name": str(row[8]) if row[8] is not None else None,
+                "description": str(row[9]) if row[9] is not None else None,
             })
 
         object_types = {"U": "table", "V": "view"}
@@ -468,6 +443,9 @@ def read_schema_objects(object_refs: list[tuple[str, str]]) -> dict:
         } for schema_name, object_name, _object_id, object_type in selected]
         return {
             "database_name": database_name,
+            "database_collation": database_collation,
+            "compatibility_level": compatibility_level,
+            "default_schema": default_schema,
             "objects": objects,
             "available_objects": available_objects,
         }
@@ -557,24 +535,6 @@ def get_schema_context(source_text: str, max_tables: int = 12) -> str:
         conn.close()
 
 
-def substitute_params(sql: str, params: dict) -> str:
-    """将 SQL 中的 {param_name} 占位符替换为实际值，自动转义单引号。"""
-    if not params:
-        return sql
-    def replacer(m):
-        key = m.group(1)
-        if key in params:
-            val = params[key]
-            if val is None or val == '':
-                return 'NULL'
-            if isinstance(val, str):
-                escaped = val.replace("'", "''")
-                return f"'{escaped}'"
-            return str(val)
-        return m.group(0)
-    return re.sub(r'\{(\w+)\}', replacer, sql)
-
-
 def get_table_relations(table_name: str) -> list[dict]:
     """查询表的外键关系，辅助理解表间关联。"""
     sql = """
@@ -613,42 +573,36 @@ def execute_sp_with_params(sp_name: str, params: dict, param_defs: list = None) 
     Raises:
         Exception: 执行失败时抛出
     """
-    # 构建 EXEC 语句
     param_parts = []
+    values = []
     if param_defs:
         for p in param_defs:
             pname = p.get("name", "")
             if not pname.startswith("@"):
                 pname = "@" + pname
+            if not re.fullmatch(r"@[A-Za-z_][A-Za-z0-9_]*", pname):
+                raise ValueError(f"非法参数名: {pname}")
             key = pname.lstrip("@")
             if key in params:
-                val = params[key]
-                if val is None or val == "":
-                    param_parts.append(f"{pname} = NULL")
-                elif isinstance(val, (int, float)):
-                    param_parts.append(f"{pname} = {val}")
-                else:
-                    escaped = str(val).replace("'", "''")
-                    param_parts.append(f"{pname} = '{escaped}'")
+                param_parts.append(f"{pname} = ?")
+                values.append(params[key])
     elif params:
         for key, val in params.items():
             pname = key if key.startswith("@") else f"@{key}"
-            if val is None or val == "":
-                param_parts.append(f"{pname} = NULL")
-            elif isinstance(val, (int, float)):
-                param_parts.append(f"{pname} = {val}")
-            else:
-                escaped = str(val).replace("'", "''")
-                param_parts.append(f"{pname} = '{escaped}'")
+            if not re.fullmatch(r"@[A-Za-z_][A-Za-z0-9_]*", pname):
+                raise ValueError(f"非法参数名: {pname}")
+            param_parts.append(f"{pname} = ?")
+            values.append(val)
 
-    safe_name = sp_name.replace("]", "]]")
-    exec_sql = f"EXEC [{safe_name}]"
+    validated_name = _validate_sp_name(sp_name)
+    safe_name = ".".join(f"[{part}]" for part in validated_name.split("."))
+    exec_sql = f"EXEC {safe_name}"
     if param_parts:
         exec_sql += " " + ", ".join(param_parts)
 
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute(exec_sql)
+    cursor.execute(exec_sql, values)
     columns = [col[0] for col in cursor.description] if cursor.description else []
     rows = []
     if columns:
